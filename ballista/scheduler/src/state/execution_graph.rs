@@ -1537,6 +1537,7 @@ impl ExecutionGraph for StaticExecutionGraph {
                     }),
                     global_input_partition_ids: input_partition_ids.clone(),
                     vcores_consumed: input_partition_ids.len() as u32,
+                    memory_usage: None,
                 };
                 stage.task_infos.push(task_info);
 
@@ -1613,6 +1614,7 @@ pub fn create_task_info(executor_id: String, task_id: usize) -> TaskInfo {
         task_status: task_status::Status::Running(RunningTask { executor_id }),
         global_input_partition_ids: vec![],
         vcores_consumed: 0,
+        memory_usage: None,
     }
 }
 

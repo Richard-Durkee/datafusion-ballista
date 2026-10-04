@@ -1333,6 +1333,10 @@ pub struct TaskStatus {
     pub end_exec_time: u64,
     #[prost(message, repeated, tag = "12")]
     pub metrics: ::prost::alloc::vec::Vec<OperatorMetricsSet>,
+    /// Memory pool accounting for this task. Absent when the executor runs
+    /// without a bounded per-task pool.
+    #[prost(message, optional, tag = "13")]
+    pub memory_usage: ::core::option::Option<TaskMemoryUsage>,
     #[prost(oneof = "task_status::Status", tags = "9, 10, 11")]
     pub status: ::core::option::Option<task_status::Status>,
 }
@@ -1347,6 +1351,16 @@ pub mod task_status {
         #[prost(message, tag = "11")]
         Successful(super::SuccessfulTask),
     }
+}
+/// How much of its memory pool a task used.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TaskMemoryUsage {
+    /// Size of the task's memory pool, in bytes.
+    #[prost(uint64, tag = "1")]
+    pub pool_limit_bytes: u64,
+    /// Most bytes the task had reserved from its pool at once.
+    #[prost(uint64, tag = "2")]
+    pub pool_peak_bytes: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PollWorkParams {

@@ -899,6 +899,7 @@ mod tests {
                     task_column_stats: vec![],
                     window_state: vec![],
                 })),
+                memory_usage: None,
             })
             .collect();
         scheduler

@@ -312,6 +312,7 @@ pub fn default_task_runner() -> impl TaskRunner {
                     task_column_stats: vec![],
                     window_state: vec![],
                 })),
+                memory_usage: None,
             });
         }
 
@@ -1300,6 +1301,7 @@ pub fn mock_completed_task(task: TaskDescription, executor_id: &str) -> TaskStat
             task_column_stats: vec![],
             window_state: vec![],
         })),
+        memory_usage: None,
     }
 }
 
@@ -1331,6 +1333,7 @@ pub fn mock_failed_task(task: TaskDescription, failed_task: FailedTask) -> TaskS
         end_exec_time: 0,
         metrics: vec![],
         status: Some(task_status::Status::Failed(failed_task)),
+        memory_usage: None,
     }
 }
 

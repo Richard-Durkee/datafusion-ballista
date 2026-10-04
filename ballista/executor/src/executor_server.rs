@@ -439,7 +439,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
                         function_registry.higher_order_functions.clone(),
                         function_registry.aggregate_functions.clone(),
                         function_registry.window_functions.clone(),
-                        runtime,
+                        runtime.clone(),
                     ))
                 };
 
@@ -466,6 +466,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
                     .ok();
                 let runtime_stats = exec.collect_runtime_stats_reports();
                 let column_stats = exec.collect_column_stats();
+                let memory_usage = crate::task_memory_usage(&runtime);
                 // Collect only when the task otherwise succeeded: a failed task's
                 // partial state is meaningless, and its own error is the useful one.
                 // A collection failure fails the task — these are load-bearing for the
@@ -501,6 +502,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
                         runtime_stats,
                         window_state,
                         column_stats,
+                        memory_usage,
                     },
                 );
 

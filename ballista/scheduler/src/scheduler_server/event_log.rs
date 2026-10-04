@@ -256,6 +256,7 @@ mod tests {
             end_exec_time: 200,
             metrics: vec![],
             status: Some(task_status::Status::Successful(SuccessfulTask::default())),
+            memory_usage: None,
         }];
         let events = task_end_events("exec-1", &statuses, None);
         assert_eq!(events.len(), 1);
@@ -279,6 +280,7 @@ mod tests {
             end_exec_time: 0,
             metrics: vec![],
             status: Some(task_status::Status::Running(Default::default())),
+            memory_usage: None,
         }];
         assert!(task_end_events("exec-1", &statuses, None).is_empty());
     }
@@ -297,6 +299,7 @@ mod tests {
             end_exec_time: 0,
             metrics: vec![],
             status: None,
+            memory_usage: None,
         }];
         assert!(task_end_events("exec-1", &statuses, None).is_empty());
     }
