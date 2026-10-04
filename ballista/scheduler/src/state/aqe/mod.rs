@@ -925,7 +925,8 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                                         failed_stages.insert(stage_id, error_msg);
                                     }
                                 }
-                                Some(FailedReason::ExecutionError(_)) => {
+                                Some(FailedReason::ExecutionError(_))
+                                | Some(FailedReason::ResourcesExhausted(_)) => {
                                     failed_stages.insert(stage_id, failed_task.error);
                                 }
                                 Some(_) => {

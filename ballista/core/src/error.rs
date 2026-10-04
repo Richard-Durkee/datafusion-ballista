@@ -25,7 +25,8 @@ use std::{
 
 use crate::serde::protobuf::failed_task::FailedReason;
 use crate::serde::protobuf::{
-    ExecutionError, FailedTask, FetchPartitionError, IoError, TaskKilled,
+    ExecutionError, FailedTask, FetchPartitionError, IoError, ResourcesExhausted,
+    TaskKilled,
 };
 use datafusion::error::DataFusionError;
 use datafusion::{arrow::error::ArrowError, sql::sqlparser::parser};
@@ -249,6 +250,21 @@ fn find_fetch_failed(e: &BallistaError) -> Option<FetchFailedDetails> {
     }
 }
 
+/// Whether the error is a memory pool refusing a reservation, carried across
+/// DataFusion under any wrapper layer.
+fn is_resources_exhausted(e: &BallistaError) -> bool {
+    match e {
+        BallistaError::DataFusionError(e) => match e.find_root() {
+            DataFusionError::ResourcesExhausted(_) => true,
+            DataFusionError::External(inner) => inner
+                .downcast_ref::<BallistaError>()
+                .is_some_and(is_resources_exhausted),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Whether the error is a retryable IO failure, native or carried across
 /// DataFusion under any wrapper layer.
 fn is_retryable_io(e: &BallistaError) -> bool {
@@ -297,6 +313,16 @@ impl From<BallistaError> for FailedTask {
                     failed_reason: Some(FailedReason::IoError(IoError {})),
                 }
             }
+            ref e if is_resources_exhausted(e) => FailedTask {
+                error: format!("Task failed due to exhausted memory: {e:?}"),
+                // Not retried, like any other execution error: a retry would
+                // get the same memory budget.
+                retryable: false,
+                count_to_failures: false,
+                failed_reason: Some(FailedReason::ResourcesExhausted(
+                    ResourcesExhausted {},
+                )),
+            },
             other => FailedTask {
                 error: format!("Task failed due to runtime execution error: {other:?}"),
                 retryable: false,
@@ -388,6 +414,25 @@ mod tests {
             task.failed_reason,
             Some(FailedReason::ExecutionError(_))
         ));
+    }
+
+    #[test]
+    fn resources_exhausted_is_classified_and_not_retried() {
+        let exhausted = DataFusionError::ResourcesExhausted("pool full".to_string());
+        // Directly, and nested the way it reaches the task (context + shared).
+        let wrapped = DataFusionError::Shared(Arc::new(DataFusionError::Context(
+            "SortExec".to_string(),
+            Box::new(DataFusionError::ResourcesExhausted("pool full".to_string())),
+        )));
+        for e in [exhausted, wrapped] {
+            let task = FailedTask::from(BallistaError::DataFusionError(Box::new(e)));
+            assert!(!task.retryable);
+            assert!(!task.count_to_failures);
+            assert!(matches!(
+                task.failed_reason,
+                Some(FailedReason::ResourcesExhausted(_))
+            ));
+        }
     }
 
     #[test]
