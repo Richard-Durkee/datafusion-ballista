@@ -62,10 +62,13 @@ pub use standalone::new_standalone_executor_from_state;
 use crate::shutdown::Shutdown;
 use ballista_core::serde::protobuf::{
     FailedTask, OperatorMetricsSet, RuntimeStatsReport, ShuffleWritePartition,
-    SuccessfulTask, TaskColumnStats, TaskStatus, WindowStateReport, task_status,
+    SuccessfulTask, TaskColumnStats, TaskMemoryUsage, TaskStatus, WindowStateReport,
+    task_status,
 };
 use ballista_core::serde::scheduler::TaskKey;
 use ballista_core::utils::GrpcServerConfig;
+use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool, PeakRecordingPool};
+use datafusion::execution::runtime_env::RuntimeEnv;
 use log::info;
 
 /// [ArrowFlightServerProvider] provides a function which creates a new Arrow Flight server.
@@ -117,6 +120,24 @@ pub struct TaskCompletionExtras {
     /// Per-column statistics folded across this task's shuffle output. Empty
     /// when the executed plan collects none (e.g. non-sort shuffle paths).
     pub column_stats: Vec<TaskColumnStats>,
+    /// How much of its memory pool the task used. See [`task_memory_usage`].
+    pub memory_usage: Option<TaskMemoryUsage>,
+}
+
+/// Reads a task's memory pool limit and peak reservation from its runtime.
+///
+/// Returns `None` unless the runtime's pool is a bounded [`PeakRecordingPool`],
+/// which is what the executor installs per task when it has a memory budget.
+/// Call it after the task has finished, so the peak covers the whole run.
+pub fn task_memory_usage(runtime: &RuntimeEnv) -> Option<TaskMemoryUsage> {
+    let pool = PeakRecordingPool::from_pool(runtime.memory_pool.as_ref())?;
+    let MemoryLimit::Finite(limit) = pool.memory_limit() else {
+        return None;
+    };
+    Some(TaskMemoryUsage {
+        pool_limit_bytes: limit as u64,
+        pool_peak_bytes: pool.max_reserved() as u64,
+    })
 }
 
 /// Converts a task execution result into a [`TaskStatus`] protobuf message.
@@ -137,6 +158,7 @@ pub fn as_task_status(
         runtime_stats,
         window_state,
         column_stats,
+        memory_usage,
     } = extras;
     let metrics = operator_metrics.unwrap_or_default();
     let task_id = key.task_id;
@@ -158,6 +180,7 @@ pub fn as_task_status(
                 start_exec_time: execution_times.start_exec_time,
                 end_exec_time: execution_times.end_exec_time,
                 metrics,
+                memory_usage,
                 status: Some(task_status::Status::Successful(SuccessfulTask {
                     executor_id,
                     partitions,
@@ -180,6 +203,7 @@ pub fn as_task_status(
                 start_exec_time: execution_times.start_exec_time,
                 end_exec_time: execution_times.end_exec_time,
                 metrics,
+                memory_usage,
                 status: Some(task_status::Status::Failed(FailedTask::from(e))),
             }
         }

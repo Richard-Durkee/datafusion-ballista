@@ -230,6 +230,12 @@ fn task_summaries(
                 finish_time: info.finish_time as u64,
                 input_rows,
                 output_rows,
+                memory_pool_limit_bytes: info
+                    .memory_usage
+                    .map(|usage| usage.pool_limit_bytes),
+                memory_pool_peak_bytes: info
+                    .memory_usage
+                    .map(|usage| usage.pool_peak_bytes),
                 status: task_status_to_dto(&info.task_status),
             })
         })
@@ -524,6 +530,7 @@ fn sum_metric(metrics: &MetricsSet, name: &str, partitions: Option<&[usize]>) ->
 mod tests {
     use super::*;
     use crate::state::execution_stage::TaskInfo;
+    use ballista_core::serde::protobuf::TaskMemoryUsage;
     use ballista_core::serde::protobuf::{OperatorMetric, operator_metric, task_status};
     use ballista_core::utils::collect_plan_metrics;
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -545,6 +552,7 @@ mod tests {
             task_status: task_status::Status::Running(Default::default()),
             global_input_partition_ids: vec![],
             vcores_consumed: 0,
+            memory_usage: None,
         }
     }
 
@@ -649,6 +657,28 @@ mod tests {
         let metrics = vec![root, output_rows(&[(0, 9)])];
         assert_eq!(slots.row_counts(&metrics, None), (9, 4));
         assert_eq!(slots.row_counts(&metrics, Some(&[0])), (9, 0));
+    }
+
+    #[test]
+    fn test_task_summaries_report_memory_usage() {
+        let plan = union_plan();
+        let slots = StageMetricSlots::of(plan.as_ref());
+        let finished = TaskInfo {
+            memory_usage: Some(TaskMemoryUsage {
+                pool_limit_bytes: 2048,
+                pool_peak_bytes: 1500,
+            }),
+            ..make_task_info(0, 10)
+        };
+        let running = make_task_info(0, 0);
+
+        let summaries = task_summaries(&[finished, running], &[], &slots);
+        let finished = summaries[0].as_ref().unwrap();
+        assert_eq!(finished.memory_pool_limit_bytes, Some(2048));
+        assert_eq!(finished.memory_pool_peak_bytes, Some(1500));
+        let running = summaries[1].as_ref().unwrap();
+        assert_eq!(running.memory_pool_limit_bytes, None);
+        assert_eq!(running.memory_pool_peak_bytes, None);
     }
 
     #[test]

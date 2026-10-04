@@ -104,6 +104,14 @@ pub struct TaskSummary {
     /// Rows the task wrote: rows produced by the stage's shuffle writer for
     /// the task's partitions.
     pub output_rows: usize,
+    /// Size of the task's memory pool, in bytes. Absent while the task is
+    /// running, or when the executor runs without a bounded per-task pool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_pool_limit_bytes: Option<u64>,
+    /// Most bytes the task had reserved from its memory pool at once. Present
+    /// whenever `memory_pool_limit_bytes` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_pool_peak_bytes: Option<u64>,
 }
 
 /// Five-number summary over a stage's tasks, used to spot skew.
@@ -230,6 +238,8 @@ mod tests {
             finish_time: 200,
             input_rows: 10,
             output_rows: 10,
+            memory_pool_limit_bytes: Some(1024),
+            memory_pool_peak_bytes: Some(512),
         };
         assert_eq!(
             get_schema_property_names::<TaskSummary>(),

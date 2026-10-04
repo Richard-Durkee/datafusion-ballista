@@ -40,7 +40,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::{fs, time};
 
-use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool};
+use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool, PeakRecordingPool};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::prelude::SessionConfig;
 
@@ -219,6 +219,10 @@ fn detect_pool(budget: MemoryBudget) -> ResolvedPool {
 /// and object-store registry are preserved via
 /// [`RuntimeEnvBuilder::from_runtime_env`].
 ///
+/// The pool is wrapped in a [`PeakRecordingPool`] so the task's peak
+/// reservation can be reported to the scheduler (see
+/// [`crate::task_memory_usage`]).
+///
 /// Returns an error if the per-task share would be zero (i.e. `total_bytes <
 /// vcores`).
 fn memory_pool_policy(
@@ -239,7 +243,8 @@ fn memory_pool_policy(
             // single-vcore share it uses; a 4-partition task gets 4×,
             // matching the parallelism DataFusion will actually drive.
             let size = per_vcore.saturating_mul(vcores_consumed.max(1) as usize);
-            let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(size));
+            let pool: Arc<dyn MemoryPool> =
+                Arc::new(PeakRecordingPool::new(Arc::new(FairSpillPool::new(size))));
             RuntimeEnvBuilder::from_runtime_env(&base)
                 .with_memory_pool(pool)
                 .build_arc()
@@ -1358,7 +1363,7 @@ mod tests {
 #[cfg(test)]
 mod memory_pool_tests {
     use super::*;
-    use datafusion::execution::memory_pool::MemoryLimit;
+    use datafusion::execution::memory_pool::{MemoryConsumer, MemoryLimit};
     use datafusion::execution::object_store::DefaultObjectStoreRegistry;
     use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
     use std::sync::Arc;
@@ -1412,6 +1417,36 @@ mod memory_pool_tests {
         let env = policy(base, &SessionConfig::new(), 1).unwrap();
 
         assert!(Arc::ptr_eq(&env.object_store_registry, &registry));
+    }
+
+    #[test]
+    fn reports_task_memory_usage_from_policy_runtime() {
+        let policy = memory_pool_policy(4096, 4).unwrap();
+        let env =
+            policy(Arc::new(RuntimeEnv::default()), &SessionConfig::new(), 2).unwrap();
+
+        // The peak is the high-water mark, not what is still held at the end.
+        let a = MemoryConsumer::new("a").register(&env.memory_pool);
+        let b = MemoryConsumer::new("b").register(&env.memory_pool);
+        a.try_grow(1000).unwrap();
+        b.try_grow(500).unwrap();
+        a.shrink(800);
+        drop(b);
+
+        let usage = crate::task_memory_usage(&env).unwrap();
+        assert_eq!(usage.pool_limit_bytes, 2048);
+        assert_eq!(usage.pool_peak_bytes, 1500);
+    }
+
+    #[test]
+    fn no_task_memory_usage_without_bounded_pool() {
+        let env = identity_pool_policy()(
+            Arc::new(RuntimeEnv::default()),
+            &SessionConfig::new(),
+            1,
+        )
+        .unwrap();
+        assert!(crate::task_memory_usage(&env).is_none());
     }
 
     #[test]

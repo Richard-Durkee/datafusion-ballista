@@ -690,6 +690,7 @@ mod test {
                         task_column_stats: vec![],
                         window_state: vec![],
                     })),
+                    memory_usage: None,
                 };
 
                 scheduler
@@ -899,6 +900,7 @@ mod test {
                                 ),
                             ),
                         })),
+                        memory_usage: None,
                     });
                 }
 
@@ -969,6 +971,7 @@ mod test {
                                 ),
                             ),
                         })),
+                        memory_usage: None,
                     });
                 }
 

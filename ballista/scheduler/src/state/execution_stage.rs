@@ -40,7 +40,7 @@ use ballista_core::execution_plans::{
 use ballista_core::serde::protobuf::failed_task::FailedReason;
 use ballista_core::serde::protobuf::{
     FailedTask, OperatorMetricsSet, ResultLost, RuntimeStatsReport, SuccessfulTask,
-    TaskKilled, TaskStatus, WindowStateReport,
+    TaskKilled, TaskMemoryUsage, TaskStatus, WindowStateReport,
 };
 use ballista_core::serde::protobuf::{RunningTask, task_status};
 use ballista_core::serde::scheduler::PartitionLocation;
@@ -396,6 +396,10 @@ pub struct TaskInfo {
     /// Used to refund the exact amount when the task completes so the
     /// executor's vcore budget stays consistent across bind/refund.
     pub vcores_consumed: u32,
+    /// How much of its memory pool the task used, as reported by the executor
+    /// with the task's final status. `None` until the task finishes, or when
+    /// the executor runs without a bounded per-task pool.
+    pub memory_usage: Option<TaskMemoryUsage>,
 }
 
 impl UnresolvedStage {
@@ -851,6 +855,7 @@ impl RunningStage {
         let scheduled_time = task_info.scheduled_time;
         let global_input_partition_ids = task_info.global_input_partition_ids.clone();
         let vcores_consumed = task_info.vcores_consumed;
+        let memory_usage = status.memory_usage;
         let task_status = status.status.unwrap();
         let updated_task_info = TaskInfo {
             task_id,
@@ -865,6 +870,7 @@ impl RunningStage {
             task_status: task_status.clone(),
             global_input_partition_ids: global_input_partition_ids.clone(),
             vcores_consumed,
+            memory_usage,
         };
         self.task_infos[task_id] = updated_task_info;
 
@@ -1488,6 +1494,7 @@ mod tests {
                 window_state: vec![],
             })),
             metrics: vec![],
+            memory_usage: None,
         }
     }
 
@@ -1542,6 +1549,7 @@ mod tests {
             }),
             global_input_partition_ids: partitions,
             vcores_consumed,
+            memory_usage: None,
         });
     }
 
@@ -1580,6 +1588,7 @@ mod tests {
                 }),
                 global_input_partition_ids: vec![task_id],
                 vcores_consumed: 1,
+                memory_usage: None,
             });
         }
         stage
@@ -1658,6 +1667,27 @@ mod tests {
             stage.task_infos[0].task_status,
             task_status::Status::Successful(_)
         ));
+    }
+
+    /// The memory usage an executor reports with a task's final status is kept
+    /// on the task's info.
+    #[test]
+    fn test_update_task_info_records_memory_usage() {
+        let mut stage = make_running_stage(2);
+        append_running_task(&mut stage, 0, "executor-1", vec![0]);
+        assert_eq!(stage.task_infos[0].memory_usage, None);
+
+        let usage = TaskMemoryUsage {
+            pool_limit_bytes: 2048,
+            pool_peak_bytes: 1500,
+        };
+        let status = TaskStatus {
+            memory_usage: Some(usage),
+            ..make_task_status(0)
+        };
+        assert!(stage.update_task_info(0, status));
+
+        assert_eq!(stage.task_infos[0].memory_usage, Some(usage));
     }
 
     /// After `reset_tasks` marks a task as ResultLost, a late status update

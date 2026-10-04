@@ -992,6 +992,17 @@ message TaskStatus {
     SuccessfulTask successful = 11;
   }
   repeated OperatorMetricsSet metrics = 12;
+  // Memory pool accounting for this task. Absent when the executor runs
+  // without a bounded per-task pool.
+  TaskMemoryUsage memory_usage = 13;
+}
+
+// How much of its memory pool a task used.
+message TaskMemoryUsage {
+  // Size of the task's memory pool, in bytes.
+  uint64 pool_limit_bytes = 1;
+  // Most bytes the task had reserved from its pool at once.
+  uint64 pool_peak_bytes = 2;
 }
 
 message PollWorkParams {

@@ -627,6 +627,8 @@ mod tests {
             end_exec_time: 0,
             exec_duration: 0,
             finish_time: 0,
+            memory_pool_limit_bytes: None,
+            memory_pool_peak_bytes: None,
         }
     }
 

@@ -1493,6 +1493,7 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                     }),
                     global_input_partition_ids: input_partition_ids.clone(),
                     vcores_consumed: input_partition_ids.len() as u32,
+                    memory_usage: None,
                 };
                 stage.task_infos.push(task_info);
 
