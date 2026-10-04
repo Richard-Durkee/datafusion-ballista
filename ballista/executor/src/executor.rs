@@ -23,6 +23,7 @@ use crate::execution_engine::QueryStageExecutor;
 use crate::execution_loop::any_to_string;
 use crate::metrics::ExecutorMetricsCollector;
 use crate::metrics::LoggingMetricsCollector;
+use crate::pool_tracker::TaskPoolTracker;
 use crate::runtime_cache::SessionRuntimeCache;
 use ballista_core::ConfigProducer;
 use ballista_core::JobId;
@@ -106,6 +107,10 @@ pub struct Executor {
     /// `produce_runtime_for_session` reuses read-side state across a session's
     /// tasks; when `None`, each task builds a runtime from `runtime_producer`.
     session_runtime_cache: Option<Arc<dyn SessionRuntimeCache>>,
+
+    /// Tracks the memory pools of running tasks, when the executor has a
+    /// bounded memory budget. Read by heartbeats to report pool usage.
+    memory_pool_tracker: Option<Arc<TaskPoolTracker>>,
 }
 
 impl Executor {
@@ -155,6 +160,7 @@ impl Executor {
             tasks_drained_waker: Default::default(),
             execution_engine,
             session_runtime_cache: None,
+            memory_pool_tracker: None,
         }
     }
     /// Creates new Executor with default `ExecutionEngine`.
@@ -180,6 +186,7 @@ impl Executor {
             tasks_drained_waker: Default::default(),
             execution_engine: Arc::new(DefaultExecutionEngine::new()),
             session_runtime_cache: None,
+            memory_pool_tracker: None,
         }
     }
 }
@@ -207,6 +214,22 @@ impl Executor {
     ) -> Self {
         self.session_runtime_cache = cache;
         self
+    }
+
+    /// Attaches (or clears) the tracker of task memory pools reported in
+    /// heartbeats. It should be the tracker the memory pool policy registers
+    /// each task's pool with.
+    pub fn with_memory_pool_tracker(
+        mut self,
+        tracker: Option<Arc<TaskPoolTracker>>,
+    ) -> Self {
+        self.memory_pool_tracker = tracker;
+        self
+    }
+
+    /// The tracker of task memory pools, if the executor has a bounded budget.
+    pub fn memory_pool_tracker(&self) -> Option<&Arc<TaskPoolTracker>> {
+        self.memory_pool_tracker.as_ref()
     }
 
     /// Produces the runtime for a task, reusing the session's shared read-side

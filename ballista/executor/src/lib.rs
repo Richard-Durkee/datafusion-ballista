@@ -41,6 +41,8 @@ pub mod flight_service;
 pub mod health;
 /// Metrics collection for executor runtime statistics.
 pub mod metrics;
+/// Tracks the memory pools of running tasks for heartbeat reporting.
+pub mod pool_tracker;
 /// Session-scoped cache of shared executor runtime environments.
 pub mod runtime_cache;
 /// Graceful shutdown coordination for executor components.

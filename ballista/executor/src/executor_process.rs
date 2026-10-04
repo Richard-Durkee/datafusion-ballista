@@ -72,6 +72,7 @@ use crate::executor_server::TERMINATING;
 use crate::flight_service::BallistaFlightService;
 use crate::metrics::ExecutorMetricCollectionPolicy;
 use crate::metrics::LoggingMetricsCollector;
+use crate::pool_tracker::TaskPoolTracker;
 use crate::runtime_cache::{
     DefaultSessionRuntimeCache, MemoryPoolPolicy, SessionRuntimeCache,
 };
@@ -219,12 +220,16 @@ fn detect_pool(budget: MemoryBudget) -> ResolvedPool {
 /// and object-store registry are preserved via
 /// [`RuntimeEnvBuilder::from_runtime_env`].
 ///
+/// Every pool is registered with `tracker`, whose capacity is the executor's
+/// total budget, so heartbeats can report the executor-wide reservation.
+///
 /// Returns an error if the per-task share would be zero (i.e. `total_bytes <
 /// vcores`).
 fn memory_pool_policy(
-    total_bytes: u64,
+    tracker: Arc<TaskPoolTracker>,
     vcores: usize,
 ) -> Result<MemoryPoolPolicy, BallistaError> {
+    let total_bytes = tracker.capacity();
     let per_vcore = (total_bytes / vcores as u64) as usize;
     if per_vcore == 0 {
         return Err(BallistaError::Configuration(format!(
@@ -240,6 +245,7 @@ fn memory_pool_policy(
             // matching the parallelism DataFusion will actually drive.
             let size = per_vcore.saturating_mul(vcores_consumed.max(1) as usize);
             let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(size));
+            tracker.track(&pool);
             RuntimeEnvBuilder::from_runtime_env(&base)
                 .with_memory_pool(pool)
                 .build_arc()
@@ -483,7 +489,7 @@ pub async fn start_executor_process(
         });
 
     let fraction = opt.memory_pool_fraction;
-    let pool_policy: MemoryPoolPolicy =
+    let (pool_policy, pool_tracker): (MemoryPoolPolicy, Option<Arc<TaskPoolTracker>>) =
         match detect_pool(memory_budget_from_cli(opt.memory_pool_size, fraction)) {
             ResolvedPool::Bounded { bytes, source } => {
                 let per_vcore = bytes / vcores as u64;
@@ -504,7 +510,8 @@ pub async fn start_executor_process(
                     bytesize::ByteSize::b(bytes),
                     bytesize::ByteSize::b(per_vcore),
                 );
-                memory_pool_policy(bytes, vcores)?
+                let tracker = Arc::new(TaskPoolTracker::new(bytes));
+                (memory_pool_policy(tracker.clone(), vcores)?, Some(tracker))
             }
             ResolvedPool::Unbounded(reason) => {
                 match reason {
@@ -516,7 +523,7 @@ pub async fn start_executor_process(
                          cgroup memory limit; set --memory-pool-size to enable spilling)"
                     ),
                 }
-                identity_pool_policy()
+                (identity_pool_policy(), None)
             }
         };
 
@@ -579,7 +586,8 @@ pub async fn start_executor_process(
                 }
             }),
         )
-        .with_session_runtime_cache(Some(session_runtime_cache)),
+        .with_session_runtime_cache(Some(session_runtime_cache))
+        .with_memory_pool_tracker(pool_tracker),
     );
 
     let connect_timeout = opt.scheduler_connect_timeout_seconds as u64;
@@ -1358,14 +1366,14 @@ mod tests {
 #[cfg(test)]
 mod memory_pool_tests {
     use super::*;
-    use datafusion::execution::memory_pool::MemoryLimit;
+    use datafusion::execution::memory_pool::{MemoryConsumer, MemoryLimit};
     use datafusion::execution::object_store::DefaultObjectStoreRegistry;
     use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
     use std::sync::Arc;
 
     #[test]
     fn returns_error_when_total_smaller_than_vcores() {
-        let result = memory_pool_policy(4, 8);
+        let result = memory_pool_policy(Arc::new(TaskPoolTracker::new(4)), 8);
         assert!(result.is_err());
         let msg = result.err().unwrap().to_string();
         assert!(msg.contains("memory_pool_size"));
@@ -1378,7 +1386,8 @@ mod memory_pool_tests {
         let vcores = 8usize;
         let per_vcore = (total / vcores as u64) as usize;
 
-        let policy = memory_pool_policy(total, vcores).unwrap();
+        let policy =
+            memory_pool_policy(Arc::new(TaskPoolTracker::new(total)), vcores).unwrap();
         let base = Arc::new(RuntimeEnv::default());
 
         // A 1-vcore task gets the per-vcore share; a 4-vcore task gets 4×.
@@ -1408,10 +1417,29 @@ mod memory_pool_tests {
                 .unwrap(),
         );
 
-        let policy = memory_pool_policy(1024, 1).unwrap();
+        let policy = memory_pool_policy(Arc::new(TaskPoolTracker::new(1024)), 1).unwrap();
         let env = policy(base, &SessionConfig::new(), 1).unwrap();
 
         assert!(Arc::ptr_eq(&env.object_store_registry, &registry));
+    }
+
+    #[test]
+    fn tracks_every_task_pool_it_creates() {
+        let tracker = Arc::new(TaskPoolTracker::new(4096));
+        let policy = memory_pool_policy(tracker.clone(), 4).unwrap();
+        let base = Arc::new(RuntimeEnv::default());
+        let env_1 = policy(base.clone(), &SessionConfig::new(), 1).unwrap();
+        let env_2 = policy(base, &SessionConfig::new(), 2).unwrap();
+
+        let r1 = MemoryConsumer::new("r1").register(&env_1.memory_pool);
+        let r2 = MemoryConsumer::new("r2").register(&env_2.memory_pool);
+        r1.try_grow(100).unwrap();
+        r2.try_grow(200).unwrap();
+        assert_eq!(tracker.reserved(), 300);
+
+        drop(r2);
+        drop(env_2);
+        assert_eq!(tracker.reserved(), 100);
     }
 
     #[test]

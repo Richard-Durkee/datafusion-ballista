@@ -748,6 +748,11 @@ message ExecutorMetric {
     uint64 proc_virtual_memory = 5;
     uint64 peak_physical_memory = 6;
     uint64 peak_virtual_memory = 7;
+    // Bytes currently reserved from the memory pools of the executor's
+    // running tasks.
+    uint64 memory_pool_reserved = 8;
+    // The executor's total memory pool budget, in bytes.
+    uint64 memory_pool_capacity = 9;
   }
 }
 

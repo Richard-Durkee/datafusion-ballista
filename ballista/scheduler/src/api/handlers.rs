@@ -88,6 +88,8 @@ pub enum ExecutorMetricResponse {
     ProcVirtualMemory(u64),
     PeakPhysicalMemory(u64),
     PeakVirtualMemory(u64),
+    MemoryPoolReserved(u64),
+    MemoryPoolCapacity(u64),
 }
 
 impl ExecutorMetricResponse {
@@ -100,6 +102,8 @@ impl ExecutorMetricResponse {
             Metric::ProcVirtualMemory(v) => Self::ProcVirtualMemory(v),
             Metric::PeakPhysicalMemory(v) => Self::PeakPhysicalMemory(v),
             Metric::PeakVirtualMemory(v) => Self::PeakVirtualMemory(v),
+            Metric::MemoryPoolReserved(v) => Self::MemoryPoolReserved(v),
+            Metric::MemoryPoolCapacity(v) => Self::MemoryPoolCapacity(v),
         })
     }
 }

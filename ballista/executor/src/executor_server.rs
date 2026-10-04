@@ -545,6 +545,28 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
 
     /// Getting executor's metrics
     fn get_executor_metrics(&self) -> Vec<ExecutorMetric> {
+        let mut metrics = self.get_memory_metrics();
+        if !matches!(
+            self.metric_collection_policy,
+            ExecutorMetricCollectionPolicy::Off
+        ) && let Some(tracker) = self.executor.memory_pool_tracker()
+        {
+            metrics.push(ExecutorMetric {
+                metric: Some(executor_metric::Metric::MemoryPoolReserved(
+                    tracker.reserved(),
+                )),
+            });
+            metrics.push(ExecutorMetric {
+                metric: Some(executor_metric::Metric::MemoryPoolCapacity(
+                    tracker.capacity(),
+                )),
+            });
+        }
+        metrics
+    }
+
+    /// Host and process memory, as selected by the metric collection policy.
+    fn get_memory_metrics(&self) -> Vec<ExecutorMetric> {
         match self.metric_collection_policy {
             ExecutorMetricCollectionPolicy::SystemOnly => {
                 let mut executor_system = System::new_all();
