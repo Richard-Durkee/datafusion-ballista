@@ -893,7 +893,8 @@ impl ExecutionGraph for StaticExecutionGraph {
                                         failed_stages.insert(stage_id, error_msg);
                                     }
                                 }
-                                Some(FailedReason::ExecutionError(_)) => {
+                                Some(FailedReason::ExecutionError(_))
+                                | Some(FailedReason::ResourcesExhausted(_)) => {
                                     failed_stages.insert(stage_id, failed_task.error);
                                 }
                                 Some(_) => {
@@ -1031,7 +1032,8 @@ impl ExecutionGraph for StaticExecutionGraph {
                         {
                             let failed_reason = failed_task.failed_reason;
                             match failed_reason {
-                                Some(FailedReason::ExecutionError(_)) => {
+                                Some(FailedReason::ExecutionError(_))
+                                | Some(FailedReason::ResourcesExhausted(_)) => {
                                     should_ignore = false;
                                     failed_stages.insert(stage_id, failed_task.error);
                                 }

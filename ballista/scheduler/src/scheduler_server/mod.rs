@@ -560,7 +560,7 @@ mod test {
 
     use ballista_core::serde::BallistaCodec;
     use ballista_core::serde::protobuf::{
-        ExecutionError, FailedTask, JobStatus, MultiTaskDefinition,
+        ExecutionError, FailedTask, JobStatus, MultiTaskDefinition, ResourcesExhausted,
         ShuffleWritePartition, SuccessfulJob, SuccessfulTask, TaskId, TaskStatus,
         failed_task, job_status, task_status,
     };
@@ -873,10 +873,35 @@ mod test {
     // Simulate a task failure and ensure the job status is updated correctly
     #[tokio::test]
     async fn test_job_failure() -> Result<()> {
+        assert_task_failure_fails_job(
+            failed_task::FailedReason::ExecutionError(ExecutionError {}),
+            false,
+        )
+        .await
+    }
+
+    // A task whose memory pool is exhausted fails the job, like any other
+    // execution error.
+    #[tokio::test]
+    async fn test_job_failure_on_resources_exhausted() -> Result<()> {
+        for adaptive in [false, true] {
+            assert_task_failure_fails_job(
+                failed_task::FailedReason::ResourcesExhausted(ResourcesExhausted {}),
+                adaptive,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn assert_task_failure_fails_job(
+        reason: failed_task::FailedReason,
+        adaptive: bool,
+    ) -> Result<()> {
         let plan = test_plan();
 
         let runner = Arc::new(TaskRunnerFn::new(
-            |_executor_id: String, task: MultiTaskDefinition| {
+            move |_executor_id: String, task: MultiTaskDefinition| {
                 let mut statuses = vec![];
 
                 for TaskId { task_id, .. } in task.task_ids {
@@ -894,11 +919,7 @@ mod test {
                             error: "ERROR".to_string(),
                             retryable: false,
                             count_to_failures: false,
-                            failed_reason: Some(
-                                failed_task::FailedReason::ExecutionError(
-                                    ExecutionError {},
-                                ),
-                            ),
+                            failed_reason: Some(reason.clone()),
                         })),
                         memory_usage: None,
                     });
@@ -918,9 +939,16 @@ mod test {
             1,
             Some(runner),
         )
-        .await?;
+        .await?
+        .with_adaptive_query_planner(adaptive);
 
-        let (status, job_id) = test.run("", &plan).await.expect("running plan");
+        // A failure reason the scheduler doesn't handle leaves the stage
+        // hanging instead of failing the job, so bound the wait.
+        let (status, job_id) =
+            tokio::time::timeout(Duration::from_secs(30), test.run("", &plan))
+                .await
+                .expect("job did not finish within 30s")
+                .expect("running plan");
 
         assert!(
             matches!(

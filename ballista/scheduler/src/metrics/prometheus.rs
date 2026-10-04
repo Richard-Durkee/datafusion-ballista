@@ -18,6 +18,7 @@
 use crate::metrics::SchedulerMetricsCollector;
 use ballista_core::JobId;
 use ballista_core::error::{BallistaError, Result};
+use ballista_core::serde::protobuf::TaskMemoryUsage;
 
 use once_cell::sync::OnceCell;
 use prometheus::{
@@ -38,6 +39,13 @@ static COLLECTOR: OnceCell<Arc<dyn SchedulerMetricsCollector>> = OnceCell::new()
 /// *job_completed_total* - Counter of completed jobs
 /// *job_submitted_total* - Counter of submitted jobs
 /// *pending_task_queue_size* - Number of pending tasks
+///
+/// and, for tasks that ran with a bounded memory pool:
+/// *ballista_task_memory_pool_peak_bytes* - Histogram of each task's peak pool reservation
+/// *ballista_task_memory_pool_utilization* - Histogram of each task's peak reservation as a
+///   fraction of its pool size
+/// *ballista_task_memory_exhausted_total* - Counter of tasks that failed because their pool
+///   refused a reservation
 pub struct PrometheusMetricsCollector {
     registry: Registry,
     execution_time: Histogram,
@@ -47,6 +55,9 @@ pub struct PrometheusMetricsCollector {
     completed: Counter,
     submitted: Counter,
     pending_queue_size: Gauge,
+    task_memory_peak: Histogram,
+    task_memory_utilization: Histogram,
+    task_memory_exhausted: Counter,
 }
 
 impl PrometheusMetricsCollector {
@@ -117,6 +128,38 @@ impl PrometheusMetricsCollector {
             BallistaError::Internal(format!("Error registering metric: {e:?}"))
         })?;
 
+        let task_memory_peak = register_histogram_with_registry!(
+            "ballista_task_memory_pool_peak_bytes",
+            "Histogram of each task's peak memory pool reservation in bytes",
+            // 1 MiB to 16 GiB in powers of 4.
+            prometheus::exponential_buckets(1024.0 * 1024.0, 4.0, 8).map_err(|e| {
+                BallistaError::Internal(format!("Error creating buckets: {e:?}"))
+            })?,
+            registry
+        )
+        .map_err(|e| {
+            BallistaError::Internal(format!("Error registering metric: {e:?}"))
+        })?;
+
+        let task_memory_utilization = register_histogram_with_registry!(
+            "ballista_task_memory_pool_utilization",
+            "Histogram of each task's peak memory pool reservation as a fraction of its pool size",
+            vec![0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 1.0],
+            registry
+        )
+        .map_err(|e| {
+            BallistaError::Internal(format!("Error registering metric: {e:?}"))
+        })?;
+
+        let task_memory_exhausted = register_counter_with_registry!(
+            "ballista_task_memory_exhausted_total",
+            "Counter of tasks that failed because their memory pool refused a reservation",
+            registry
+        )
+        .map_err(|e| {
+            BallistaError::Internal(format!("Error registering metric: {e:?}"))
+        })?;
+
         Ok(Self {
             registry: registry.clone(),
             execution_time,
@@ -126,6 +169,9 @@ impl PrometheusMetricsCollector {
             completed,
             submitted,
             pending_queue_size,
+            task_memory_peak,
+            task_memory_utilization,
+            task_memory_exhausted,
         })
     }
 
@@ -166,6 +212,18 @@ impl SchedulerMetricsCollector for PrometheusMetricsCollector {
         self.pending_queue_size.set(value as f64);
     }
 
+    fn record_task_memory(&self, usage: &TaskMemoryUsage) {
+        self.task_memory_peak.observe(usage.pool_peak_bytes as f64);
+        if usage.pool_limit_bytes > 0 {
+            self.task_memory_utilization
+                .observe(usage.pool_peak_bytes as f64 / usage.pool_limit_bytes as f64);
+        }
+    }
+
+    fn record_task_memory_exhausted(&self) {
+        self.task_memory_exhausted.inc();
+    }
+
     fn gather_metrics(&self) -> Result<Option<(Vec<u8>, String)>> {
         let encoder = TextEncoder::new();
 
@@ -196,6 +254,41 @@ mod tests {
         assert!(content_type.starts_with("text/plain"));
         assert!(text.contains("job_submitted_total 1"), "{text}");
         assert!(text.contains("pending_task_queue_size 3"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn records_task_memory_metrics() -> Result<()> {
+        let registry = Registry::new();
+        let collector = PrometheusMetricsCollector::new(&registry)?;
+        collector.record_task_memory(&TaskMemoryUsage {
+            pool_limit_bytes: 1024,
+            pool_peak_bytes: 512,
+        });
+        // A zero limit can't produce a utilization, but the peak is still kept.
+        collector.record_task_memory(&TaskMemoryUsage {
+            pool_limit_bytes: 0,
+            pool_peak_bytes: 256,
+        });
+        collector.record_task_memory_exhausted();
+
+        let families = registry.gather();
+        let family = |name: &str| {
+            families
+                .iter()
+                .find(|f| f.name() == name)
+                .unwrap_or_else(|| panic!("{name} not registered"))
+                .get_metric()[0]
+                .clone()
+        };
+        let peak = family("ballista_task_memory_pool_peak_bytes");
+        assert_eq!(peak.get_histogram().get_sample_count(), 2);
+        assert_eq!(peak.get_histogram().get_sample_sum(), 768.0);
+        let utilization = family("ballista_task_memory_pool_utilization");
+        assert_eq!(utilization.get_histogram().get_sample_count(), 1);
+        assert_eq!(utilization.get_histogram().get_sample_sum(), 0.5);
+        let exhausted = family("ballista_task_memory_exhausted_total");
+        assert_eq!(exhausted.get_counter().value(), 1.0);
         Ok(())
     }
 }

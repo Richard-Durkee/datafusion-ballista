@@ -21,6 +21,7 @@ pub mod prometheus;
 
 #[cfg(feature = "prometheus")]
 use crate::metrics::prometheus::PrometheusMetricsCollector;
+use ballista_core::serde::protobuf::TaskMemoryUsage;
 use ballista_core::{JobId, error::Result};
 use std::sync::Arc;
 
@@ -48,6 +49,13 @@ pub trait SchedulerMetricsCollector: Send + Sync {
 
     /// Record that job with `job_id` was cancelled.
     fn record_cancelled(&self, job_id: &JobId);
+
+    /// Record how much of its memory pool a finished task used, as reported by
+    /// the executor. Only called for tasks that ran with a bounded pool.
+    fn record_task_memory(&self, _usage: &TaskMemoryUsage) {}
+
+    /// Record that a task failed because its memory pool refused a reservation.
+    fn record_task_memory_exhausted(&self) {}
 
     /// Set the current number of pending tasks in scheduler. A pending task is a task that is available
     /// to schedule on an executor but cannot be scheduled because no resources are available.

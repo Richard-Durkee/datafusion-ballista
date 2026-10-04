@@ -705,6 +705,15 @@ impl SchedulerTest {
             .await
     }
 
+    /// Switches the adaptive query planner on or off for jobs run from here
+    /// on. The harness pins the static planner by default.
+    pub fn with_adaptive_query_planner(mut self, enabled: bool) -> Self {
+        self.session_config = self
+            .session_config
+            .with_ballista_adaptive_query_planner(enabled);
+        self
+    }
+
     /// Returns job status and job_id
     pub async fn run(
         &mut self,

@@ -135,6 +135,30 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> QueryStageSchedul
     }
 }
 
+/// Records the memory usage and memory-exhaustion failures carried by a batch
+/// of task status updates.
+fn record_task_memory_metrics(
+    collector: &dyn SchedulerMetricsCollector,
+    statuses: &[ballista_core::serde::protobuf::TaskStatus],
+) {
+    use ballista_core::serde::protobuf::failed_task::FailedReason;
+    use ballista_core::serde::protobuf::task_status::Status;
+
+    for status in statuses {
+        if let Some(usage) = &status.memory_usage {
+            collector.record_task_memory(usage);
+        }
+        if let Some(Status::Failed(failed)) = &status.status
+            && matches!(
+                failed.failed_reason,
+                Some(FailedReason::ResourcesExhausted(_))
+            )
+        {
+            collector.record_task_memory_exhausted();
+        }
+    }
+}
+
 /// Groups task status updates by job id, so a single `TaskUpdating` batch
 /// (which can span multiple jobs) can be appended to each job's own event log.
 #[cfg(feature = "rest-api")]
@@ -480,6 +504,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                 );
 
                 let num_status = tasks_status.len();
+                record_task_memory_metrics(
+                    self.metrics_collector.as_ref(),
+                    &tasks_status,
+                );
                 if self.state.config.is_push_staged_scheduling() {
                     // Refund the vcores each completing task consumed at bind
                     // time (see `bind_one` in `cluster/mod.rs`). Refunding
@@ -668,15 +696,18 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
 mod tests {
     use crate::cluster::JobStateEvent;
     use crate::config::{SchedulerConfig, WorkAvailableReason};
+    use crate::metrics::SchedulerMetricsCollector;
     use crate::scheduler_server::SchedulerServer;
     use crate::test_utils::{
         SchedulerTest, TestMetricsCollector, await_condition, test_cluster_context,
     };
     use ballista_core::BALLISTA_PROTOCOL_VERSION;
+    use ballista_core::JobId;
     use ballista_core::config::TaskSchedulingPolicy;
     use ballista_core::error::Result;
     use ballista_core::extension::SessionConfigExt;
     use ballista_core::serde::BallistaCodec;
+    use ballista_core::serde::protobuf::TaskMemoryUsage;
     use ballista_core::serde::protobuf::job_status;
     use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpc;
     use ballista_core::serde::protobuf::{
@@ -691,6 +722,75 @@ mod tests {
     use datafusion::logical_expr::{LogicalPlan, col};
     use datafusion::prelude::SessionConfig;
     use datafusion::test_util::scan_empty_with_partitions;
+
+    /// Counts the task memory events it receives.
+    #[derive(Default)]
+    struct TaskMemoryCounter {
+        peaks: parking_lot::Mutex<Vec<u64>>,
+        exhausted: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SchedulerMetricsCollector for TaskMemoryCounter {
+        fn record_submitted(&self, _: &JobId, _: u64, _: u64) {}
+        fn record_completed(&self, _: &JobId, _: u64, _: u64) {}
+        fn record_failed(&self, _: &JobId, _: u64, _: u64) {}
+        fn record_cancelled(&self, _: &JobId) {}
+        fn set_pending_tasks_queue_size(&self, _: u64) {}
+        fn gather_metrics(&self) -> Result<Option<(Vec<u8>, String)>> {
+            Ok(None)
+        }
+        fn record_task_memory(&self, usage: &TaskMemoryUsage) {
+            self.peaks.lock().push(usage.pool_peak_bytes);
+        }
+        fn record_task_memory_exhausted(&self) {
+            self.exhausted
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn records_task_memory_from_status_updates() {
+        use ballista_core::serde::protobuf::failed_task::FailedReason;
+        use ballista_core::serde::protobuf::{
+            ExecutionError, FailedTask, ResourcesExhausted, TaskStatus, task_status,
+        };
+
+        let failed = |reason| TaskStatus {
+            status: Some(task_status::Status::Failed(FailedTask {
+                failed_reason: Some(reason),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let statuses = vec![
+            TaskStatus {
+                memory_usage: Some(TaskMemoryUsage {
+                    pool_limit_bytes: 1024,
+                    pool_peak_bytes: 512,
+                }),
+                ..Default::default()
+            },
+            // No pool: nothing to record.
+            TaskStatus::default(),
+            TaskStatus {
+                memory_usage: Some(TaskMemoryUsage {
+                    pool_limit_bytes: 1024,
+                    pool_peak_bytes: 1024,
+                }),
+                ..failed(FailedReason::ResourcesExhausted(ResourcesExhausted {}))
+            },
+            failed(FailedReason::ExecutionError(ExecutionError {})),
+        ];
+
+        let counter = TaskMemoryCounter::default();
+        super::record_task_memory_metrics(&counter, &statuses);
+
+        assert_eq!(*counter.peaks.lock(), vec![512, 1024]);
+        assert_eq!(
+            counter.exhausted.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
     use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
     use futures::StreamExt;
     use std::sync::{Arc, Mutex};
