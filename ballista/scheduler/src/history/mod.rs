@@ -598,6 +598,8 @@ mod tests {
                 stage_plan: None,
                 task_duration_percentiles: None,
                 task_input_percentiles: None,
+                task_memory_peak_percentiles: None,
+                memory_peak_task: None,
                 tasks: vec![],
             }],
         };

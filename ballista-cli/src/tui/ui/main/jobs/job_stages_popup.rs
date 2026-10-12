@@ -38,6 +38,7 @@ pub(crate) fn render_job_stages_popup(f: &mut Frame, app: &App) {
         Cell::from(Text::from("Input Rows").right_aligned()),
         Cell::from(Text::from("Output Rows").right_aligned()),
         Cell::from(Text::from("Compute Time").right_aligned()),
+        Cell::from(Text::from("Peak memory\n(% of task pool)").right_aligned()),
         Cell::from(Text::from("Input percentiles\n(min/p25/med/p75/max)").centered()),
         Cell::from(Text::from("Duration percentiles\n(min/p25/med/p75/max)").centered()),
     ])
@@ -54,13 +55,14 @@ pub(crate) fn render_job_stages_popup(f: &mut Frame, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(7),  // stage id
+            Constraint::Percentage(6),  // stage id
             Constraint::Percentage(7),  // status
-            Constraint::Percentage(10), // input rows
-            Constraint::Percentage(10), // output rows
-            Constraint::Percentage(10), // elapsed compute
-            Constraint::Percentage(28), // input percentiles
-            Constraint::Percentage(28), // duration percentiles
+            Constraint::Percentage(9),  // input rows
+            Constraint::Percentage(9),  // output rows
+            Constraint::Percentage(9),  // elapsed compute
+            Constraint::Percentage(12), // peak memory
+            Constraint::Percentage(24), // input percentiles
+            Constraint::Percentage(24), // duration percentiles
         ],
     )
     .block(
@@ -123,6 +125,19 @@ fn build_stage_row(i: usize, stage: &JobStageResponse, app: &App) -> Row<'static
         },
     );
 
+    // The stage's memory headroom: the task that came closest to its pool
+    // limit, e.g. "94% (538.0 MB)".
+    let peak_memory = stage.memory_peak_task.as_ref().map_or_else(
+        || "N/A".to_string(),
+        |peak| {
+            format!(
+                "{:.0}% ({})",
+                peak.pool_used_percent,
+                app.format_size(peak.peak_bytes.try_into().unwrap_or(usize::MAX))
+            )
+        },
+    );
+
     Row::new(vec![
         Cell::from(Text::from(stage.stage_id.clone()).right_aligned()),
         Cell::from(
@@ -136,6 +151,7 @@ fn build_stage_row(i: usize, stage: &JobStageResponse, app: &App) -> Row<'static
             Text::from(stage.elapsed_compute.clone().unwrap_or("N/A".to_string()))
                 .right_aligned(),
         ),
+        Cell::from(Text::from(peak_memory).right_aligned()),
         Cell::from(Text::from(input_percentiles).centered()),
         Cell::from(Text::from(duration_percentiles).centered()),
     ])

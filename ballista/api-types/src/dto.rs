@@ -130,6 +130,24 @@ pub struct Percentiles {
     pub max: u64,
 }
 
+/// The task in a stage that used the largest share of its memory pool.
+///
+/// Tasks can have pools of different sizes (a task that claims more vcores
+/// gets a larger share of the executor's budget), so the share, not the raw
+/// peak, is what says how close the stage came to running out of memory.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct StageMemoryPeak {
+    /// Task id, as in [`TaskSummary::id`].
+    pub task_id: usize,
+    /// Most bytes the task had reserved from its memory pool at once.
+    pub peak_bytes: u64,
+    /// Size of the task's memory pool, in bytes.
+    pub pool_limit_bytes: u64,
+    /// `peak_bytes` as a percentage of `pool_limit_bytes`.
+    pub pool_used_percent: f64,
+}
+
 /// Summary of one query stage, served by `GET /api/job/{job_id}/stages`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
@@ -155,6 +173,14 @@ pub struct QueryStageSummary {
     /// Distribution of per-task input row counts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_input_percentiles: Option<Percentiles>,
+    /// Distribution of per-task peak memory pool reservation, in bytes, over
+    /// the finished tasks that ran with a bounded pool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_memory_peak_percentiles: Option<Percentiles>,
+    /// The finished task that came closest to its memory pool limit: the
+    /// stage's memory headroom. Absent until such a task has finished.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_peak_task: Option<StageMemoryPeak>,
     /// One entry per task. Always `Some` today; the `Option` predates
     /// multi-partition tasks, when this list was indexed by partition and
     /// could be sparse.

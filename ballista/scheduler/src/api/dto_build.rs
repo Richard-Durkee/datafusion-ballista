@@ -34,7 +34,7 @@ use crate::state::execution_stage::TaskInfo;
 use crate::state::task_manager::JobOverview;
 use ballista_api_types::dto::{
     JobConfig, JobResponse, Percentiles, PlanFormat, QueryStageSummary,
-    QueryStagesResponse, TaskStatus, TaskSummary,
+    QueryStagesResponse, StageMemoryPeak, TaskStatus, TaskSummary,
 };
 use ballista_core::serde::protobuf::failed_task::FailedReason::{
     ExecutionError, ExecutorLost, FetchPartitionError, IoError, ResultLost, TaskKilled,
@@ -173,6 +173,8 @@ pub fn graph_to_query_stages(
                     .then(|| render_stage_plan(stage.plan(), metrics, plan_format)),
                 task_duration_percentiles: task_duration_percentiles(&tasks),
                 task_input_percentiles: task_input_percentiles(&tasks),
+                task_memory_peak_percentiles: task_memory_peak_percentiles(&tasks),
+                memory_peak_task: memory_peak_task(&tasks),
                 tasks,
             }
         })
@@ -334,6 +336,35 @@ fn task_input_percentiles(tasks: &[Option<TaskSummary>]) -> Option<Percentiles> 
 
 fn task_duration_percentiles(tasks: &[Option<TaskSummary>]) -> Option<Percentiles> {
     percentiles_of(tasks.iter().flatten().map(|t| t.exec_duration).collect())
+}
+
+fn task_memory_peak_percentiles(tasks: &[Option<TaskSummary>]) -> Option<Percentiles> {
+    percentiles_of(
+        tasks
+            .iter()
+            .flatten()
+            .filter_map(|t| t.memory_pool_peak_bytes)
+            .collect(),
+    )
+}
+
+/// The task that used the largest share of its memory pool. Tasks without a
+/// reported, non-zero pool limit are skipped.
+fn memory_peak_task(tasks: &[Option<TaskSummary>]) -> Option<StageMemoryPeak> {
+    tasks
+        .iter()
+        .flatten()
+        .filter_map(|t| {
+            let limit = t.memory_pool_limit_bytes.filter(|limit| *limit > 0)?;
+            let peak = t.memory_pool_peak_bytes?;
+            Some(StageMemoryPeak {
+                task_id: t.id,
+                peak_bytes: peak,
+                pool_limit_bytes: limit,
+                pool_used_percent: peak as f64 * 100.0 / limit as f64,
+            })
+        })
+        .max_by(|a, b| a.pool_used_percent.total_cmp(&b.pool_used_percent))
 }
 
 /// Returns elapsed wall time in milliseconds for API formatting.
@@ -679,6 +710,45 @@ mod tests {
         let running = summaries[1].as_ref().unwrap();
         assert_eq!(running.memory_pool_limit_bytes, None);
         assert_eq!(running.memory_pool_peak_bytes, None);
+    }
+
+    /// The stage's memory headroom is the task with the largest share of its
+    /// own pool, not the largest peak: a task with a bigger pool can hold more
+    /// bytes and still be further from running out.
+    #[test]
+    fn test_memory_peak_task_is_largest_share_of_pool() {
+        let plan = union_plan();
+        let slots = StageMetricSlots::of(plan.as_ref());
+        let with_usage = |task_id, pool_limit_bytes, pool_peak_bytes| TaskInfo {
+            memory_usage: Some(TaskMemoryUsage {
+                pool_limit_bytes,
+                pool_peak_bytes,
+            }),
+            task_id,
+            ..make_task_info(0, 10)
+        };
+        let task_infos = [
+            with_usage(0, 4000, 2000), // 50%, largest peak
+            with_usage(1, 1000, 900),  // 90%
+            make_task_info(0, 0),      // still running, nothing reported
+        ];
+
+        let tasks = task_summaries(&task_infos, &[], &slots);
+        assert_eq!(
+            memory_peak_task(&tasks),
+            Some(StageMemoryPeak {
+                task_id: 1,
+                peak_bytes: 900,
+                pool_limit_bytes: 1000,
+                pool_used_percent: 90.0,
+            })
+        );
+        let peaks = task_memory_peak_percentiles(&tasks).unwrap();
+        assert_eq!((peaks.min, peaks.max), (900, 2000));
+
+        let running = task_summaries(&[make_task_info(0, 0)], &[], &slots);
+        assert_eq!(memory_peak_task(&running), None);
+        assert!(task_memory_peak_percentiles(&running).is_none());
     }
 
     #[test]

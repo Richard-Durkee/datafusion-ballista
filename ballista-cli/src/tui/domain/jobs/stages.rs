@@ -347,6 +347,8 @@ mod tests {
             elapsed_compute: Some("1ns".to_string()),
             task_duration_percentiles: Some(make_percentiles()),
             task_input_percentiles: Some(make_percentiles()),
+            task_memory_peak_percentiles: None,
+            memory_peak_task: None,
             tasks: Vec::new(),
         }
     }
