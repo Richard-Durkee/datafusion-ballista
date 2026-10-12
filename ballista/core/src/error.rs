@@ -290,7 +290,7 @@ impl From<BallistaError> for FailedTask {
             },
             ref e if is_retryable_io(e) => {
                 FailedTask {
-                    error: format!("Task failed due to IO error: {e:?}"),
+                    error: format!("Task failed due to IO error: {e}"),
                     // IO error is considered to be temporary and retryable
                     retryable: true,
                     count_to_failures: true,
@@ -298,7 +298,7 @@ impl From<BallistaError> for FailedTask {
                 }
             }
             other => FailedTask {
-                error: format!("Task failed due to runtime execution error: {other:?}"),
+                error: format!("Task failed due to runtime execution error: {other}"),
                 retryable: false,
                 count_to_failures: false,
                 failed_reason: Some(FailedReason::ExecutionError(ExecutionError {})),
@@ -412,6 +412,21 @@ mod tests {
             task.failed_reason,
             Some(FailedReason::ExecutionError(_))
         ));
+    }
+
+    #[test]
+    fn failed_task_error_is_readable() {
+        let e = BallistaError::DataFusionError(Box::new(
+            DataFusionError::ResourcesExhausted(
+                "Failed to allocate\n  HashJoinInput[0] consumed 2.6 MB".to_string(),
+            ),
+        ));
+        let task = FailedTask::from(e);
+        assert_eq!(
+            task.error,
+            "Task failed due to runtime execution error: DataFusion error: \
+             Resources exhausted: Failed to allocate\n  HashJoinInput[0] consumed 2.6 MB"
+        );
     }
 
     /// Builds the single-wrap shape that reaches task failure classification.
