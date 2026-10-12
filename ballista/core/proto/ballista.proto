@@ -1003,6 +1003,11 @@ message TaskMemoryUsage {
   uint64 pool_limit_bytes = 1;
   // Most bytes the task had reserved from its pool at once.
   uint64 pool_peak_bytes = 2;
+  // The memory consumer (an operator's reservation, e.g. `HashJoinInput[3]`)
+  // that held the most at once. Empty if nothing was reserved.
+  string top_consumer = 3;
+  // Most bytes `top_consumer` held at once.
+  uint64 top_consumer_peak_bytes = 4;
 }
 
 message PollWorkParams {

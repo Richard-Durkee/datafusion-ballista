@@ -631,6 +631,7 @@ mod tests {
             finish_time: 0,
             memory_pool_limit_bytes: None,
             memory_pool_peak_bytes: None,
+            memory_top_consumer: None,
         }
     }
 

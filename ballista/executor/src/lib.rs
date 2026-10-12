@@ -407,6 +407,7 @@ pub use standalone::new_standalone_executor;
 pub use standalone::new_standalone_executor_from_builder;
 pub use standalone::new_standalone_executor_from_state;
 
+use crate::metrics::ConsumerPeaksPool;
 use crate::shutdown::Shutdown;
 use ballista_core::serde::protobuf::{
     FailedTask, OperatorMetricsSet, RuntimeStatsReport, ShuffleWritePartition,
@@ -472,19 +473,29 @@ pub struct TaskCompletionExtras {
     pub memory_usage: Option<TaskMemoryUsage>,
 }
 
-/// Reads a task's memory pool limit and peak reservation from its runtime.
+/// Reads a task's memory pool limit, peak reservation and largest memory
+/// consumer from its runtime.
 ///
-/// Returns `None` unless the runtime's pool is a bounded [`PeakRecordingPool`],
-/// which is what the executor installs per task when it has a memory budget.
-/// Call it after the task has finished, so the peak covers the whole run.
+/// Returns `None` unless the runtime's pool is a [`ConsumerPeaksPool`] over a
+/// bounded [`PeakRecordingPool`], which is what the executor installs per task
+/// when it has a memory budget. Call it after the task has finished, so the
+/// peaks cover the whole run.
 pub fn task_memory_usage(runtime: &RuntimeEnv) -> Option<TaskMemoryUsage> {
-    let pool = PeakRecordingPool::from_pool(runtime.memory_pool.as_ref())?;
+    let consumers = runtime
+        .memory_pool
+        .as_ref()
+        .downcast_ref::<ConsumerPeaksPool>()?;
+    let pool = PeakRecordingPool::from_pool(consumers.inner())?;
     let MemoryLimit::Finite(limit) = pool.memory_limit() else {
         return None;
     };
+    let (top_consumer, top_consumer_peak_bytes) =
+        consumers.largest_consumer().unwrap_or_default();
     Some(TaskMemoryUsage {
         pool_limit_bytes: limit as u64,
         pool_peak_bytes: pool.max_reserved() as u64,
+        top_consumer,
+        top_consumer_peak_bytes: top_consumer_peak_bytes as u64,
     })
 }
 

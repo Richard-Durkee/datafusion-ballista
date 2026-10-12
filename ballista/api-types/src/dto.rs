@@ -112,6 +112,21 @@ pub struct TaskSummary {
     /// whenever `memory_pool_limit_bytes` is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_pool_peak_bytes: Option<u64>,
+    /// The memory consumer that held the most of the task's pool at once.
+    /// Absent until the task finishes, or if it reserved nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_top_consumer: Option<MemoryConsumerPeak>,
+}
+
+/// A memory consumer, typically one operator's reservation for one
+/// partition such as `HashJoinInput[3]`, and the most it held at once.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct MemoryConsumerPeak {
+    /// Consumer name, as DataFusion reports it in out-of-memory errors.
+    pub name: String,
+    /// Most bytes the consumer held at once.
+    pub peak_bytes: u64,
 }
 
 /// Five-number summary over a stage's tasks, used to spot skew.
@@ -146,6 +161,9 @@ pub struct StageMemoryPeak {
     pub pool_limit_bytes: u64,
     /// `peak_bytes` as a percentage of `pool_limit_bytes`.
     pub pool_used_percent: f64,
+    /// The memory consumer that held the most of this task's pool at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_consumer: Option<MemoryConsumerPeak>,
 }
 
 /// Summary of one query stage, served by `GET /api/job/{job_id}/stages`.
@@ -266,6 +284,10 @@ mod tests {
             output_rows: 10,
             memory_pool_limit_bytes: Some(1024),
             memory_pool_peak_bytes: Some(512),
+            memory_top_consumer: Some(MemoryConsumerPeak {
+                name: "HashJoinInput[0]".to_string(),
+                peak_bytes: 256,
+            }),
         };
         assert_eq!(
             get_schema_property_names::<TaskSummary>(),

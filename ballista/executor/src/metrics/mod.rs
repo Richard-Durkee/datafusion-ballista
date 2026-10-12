@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod consumer_peaks;
+
+pub use consumer_peaks::ConsumerPeaksPool;
+
 use crate::execution_engine::QueryStageExecutor;
 use ballista_core::JobId;
 use datafusion::execution::memory_pool::MemoryPool;

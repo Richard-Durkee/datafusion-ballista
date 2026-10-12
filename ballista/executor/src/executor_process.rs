@@ -71,7 +71,9 @@ use crate::executor::{Executor, TasksDrainedFuture};
 use crate::executor_server::TERMINATING;
 use crate::flight_service::BallistaFlightService;
 use crate::metrics::LoggingMetricsCollector;
-use crate::metrics::{ExecutorMemoryMetrics, ExecutorMetricCollectionPolicy};
+use crate::metrics::{
+    ConsumerPeaksPool, ExecutorMemoryMetrics, ExecutorMetricCollectionPolicy,
+};
 use crate::runtime_cache::{
     DefaultSessionRuntimeCache, MemoryPoolPolicy, SessionRuntimeCache,
 };
@@ -243,8 +245,9 @@ fn memory_pool_policy(
             // single-vcore share it uses; a 4-partition task gets 4×,
             // matching the parallelism DataFusion will actually drive.
             let size = per_vcore.saturating_mul(vcores_consumed.max(1) as usize);
-            let pool: Arc<dyn MemoryPool> =
-                Arc::new(PeakRecordingPool::new(Arc::new(FairSpillPool::new(size))));
+            let pool: Arc<dyn MemoryPool> = Arc::new(ConsumerPeaksPool::new(Arc::new(
+                PeakRecordingPool::new(Arc::new(FairSpillPool::new(size))),
+            )));
             RuntimeEnvBuilder::from_runtime_env(&base)
                 .with_memory_pool(pool)
                 .build_arc()
@@ -1420,7 +1423,7 @@ mod memory_pool_tests {
         let base = Arc::new(RuntimeEnv::default());
         let first = policy(base.clone(), &SessionConfig::new(), 1).unwrap();
         let second = policy(base, &SessionConfig::new(), 4).unwrap();
-        assert!(first.memory_pool.is::<PeakRecordingPool>());
+        assert!(first.memory_pool.is::<ConsumerPeaksPool>());
         assert!(matches!(
             first.memory_pool.memory_limit(),
             MemoryLimit::Finite(1024)
@@ -1559,6 +1562,8 @@ mod memory_pool_tests {
         let usage = crate::task_memory_usage(&env).unwrap();
         assert_eq!(usage.pool_limit_bytes, 2048);
         assert_eq!(usage.pool_peak_bytes, 1500);
+        assert_eq!(usage.top_consumer, "a");
+        assert_eq!(usage.top_consumer_peak_bytes, 1000);
     }
 
     #[test]

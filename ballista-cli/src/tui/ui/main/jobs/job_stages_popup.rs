@@ -126,15 +126,17 @@ fn build_stage_row(i: usize, stage: &JobStageResponse, app: &App) -> Row<'static
     );
 
     // The stage's memory headroom: the task that came closest to its pool
-    // limit, e.g. "94% (538.0 MB)".
+    // limit and the consumer that held the most of it, e.g.
+    // "94% HashJoinInput[3]", or "94% (538.0 MB)" without a consumer.
     let peak_memory = stage.memory_peak_task.as_ref().map_or_else(
         || "N/A".to_string(),
-        |peak| {
-            format!(
+        |peak| match &peak.top_consumer {
+            Some(consumer) => format!("{:.0}% {}", peak.pool_used_percent, consumer.name),
+            None => format!(
                 "{:.0}% ({})",
                 peak.pool_used_percent,
                 app.format_size(peak.peak_bytes.try_into().unwrap_or(usize::MAX))
-            )
+            ),
         },
     );
 

@@ -33,8 +33,8 @@ use crate::state::execution_graph_dot::ExecutionGraphDot;
 use crate::state::execution_stage::TaskInfo;
 use crate::state::task_manager::JobOverview;
 use ballista_api_types::dto::{
-    JobConfig, JobResponse, Percentiles, PlanFormat, QueryStageSummary,
-    QueryStagesResponse, StageMemoryPeak, TaskStatus, TaskSummary,
+    JobConfig, JobResponse, MemoryConsumerPeak, Percentiles, PlanFormat,
+    QueryStageSummary, QueryStagesResponse, StageMemoryPeak, TaskStatus, TaskSummary,
 };
 use ballista_core::serde::protobuf::failed_task::FailedReason::{
     ExecutionError, ExecutorLost, FetchPartitionError, IoError, ResultLost, TaskKilled,
@@ -234,10 +234,20 @@ fn task_summaries(
                 output_rows,
                 memory_pool_limit_bytes: info
                     .memory_usage
+                    .as_ref()
                     .map(|usage| usage.pool_limit_bytes),
                 memory_pool_peak_bytes: info
                     .memory_usage
+                    .as_ref()
                     .map(|usage| usage.pool_peak_bytes),
+                memory_top_consumer: info
+                    .memory_usage
+                    .as_ref()
+                    .filter(|usage| !usage.top_consumer.is_empty())
+                    .map(|usage| MemoryConsumerPeak {
+                        name: usage.top_consumer.clone(),
+                        peak_bytes: usage.top_consumer_peak_bytes,
+                    }),
                 status: task_status_to_dto(&info.task_status),
             })
         })
@@ -362,6 +372,7 @@ fn memory_peak_task(tasks: &[Option<TaskSummary>]) -> Option<StageMemoryPeak> {
                 peak_bytes: peak,
                 pool_limit_bytes: limit,
                 pool_used_percent: peak as f64 * 100.0 / limit as f64,
+                top_consumer: t.memory_top_consumer.clone(),
             })
         })
         .max_by(|a, b| a.pool_used_percent.total_cmp(&b.pool_used_percent))
@@ -698,6 +709,8 @@ mod tests {
             memory_usage: Some(TaskMemoryUsage {
                 pool_limit_bytes: 2048,
                 pool_peak_bytes: 1500,
+                top_consumer: "HashJoinInput[3]".to_string(),
+                top_consumer_peak_bytes: 1200,
             }),
             ..make_task_info(0, 10)
         };
@@ -707,9 +720,17 @@ mod tests {
         let finished = summaries[0].as_ref().unwrap();
         assert_eq!(finished.memory_pool_limit_bytes, Some(2048));
         assert_eq!(finished.memory_pool_peak_bytes, Some(1500));
+        assert_eq!(
+            finished.memory_top_consumer,
+            Some(MemoryConsumerPeak {
+                name: "HashJoinInput[3]".to_string(),
+                peak_bytes: 1200,
+            })
+        );
         let running = summaries[1].as_ref().unwrap();
         assert_eq!(running.memory_pool_limit_bytes, None);
         assert_eq!(running.memory_pool_peak_bytes, None);
+        assert_eq!(running.memory_top_consumer, None);
     }
 
     /// The stage's memory headroom is the task with the largest share of its
@@ -723,6 +744,7 @@ mod tests {
             memory_usage: Some(TaskMemoryUsage {
                 pool_limit_bytes,
                 pool_peak_bytes,
+                ..Default::default()
             }),
             task_id,
             ..make_task_info(0, 10)
@@ -741,6 +763,7 @@ mod tests {
                 peak_bytes: 900,
                 pool_limit_bytes: 1000,
                 pool_used_percent: 90.0,
+                top_consumer: None,
             })
         );
         let peaks = task_memory_peak_percentiles(&tasks).unwrap();

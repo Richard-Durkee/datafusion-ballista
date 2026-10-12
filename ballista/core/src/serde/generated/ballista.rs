@@ -1353,7 +1353,7 @@ pub mod task_status {
     }
 }
 /// How much of its memory pool a task used.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TaskMemoryUsage {
     /// Size of the task's memory pool, in bytes.
     #[prost(uint64, tag = "1")]
@@ -1361,6 +1361,13 @@ pub struct TaskMemoryUsage {
     /// Most bytes the task had reserved from its pool at once.
     #[prost(uint64, tag = "2")]
     pub pool_peak_bytes: u64,
+    /// The memory consumer (an operator's reservation, e.g. `HashJoinInput\[3\]`)
+    /// that held the most at once. Empty if nothing was reserved.
+    #[prost(string, tag = "3")]
+    pub top_consumer: ::prost::alloc::string::String,
+    /// Most bytes `top_consumer` held at once.
+    #[prost(uint64, tag = "4")]
+    pub top_consumer_peak_bytes: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PollWorkParams {

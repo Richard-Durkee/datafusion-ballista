@@ -1680,9 +1680,11 @@ mod tests {
         let usage = TaskMemoryUsage {
             pool_limit_bytes: 2048,
             pool_peak_bytes: 1500,
+            top_consumer: "HashJoinInput[0]".to_string(),
+            top_consumer_peak_bytes: 1000,
         };
         let status = TaskStatus {
-            memory_usage: Some(usage),
+            memory_usage: Some(usage.clone()),
             ..make_task_status(0)
         };
         assert!(stage.update_task_info(0, status));
