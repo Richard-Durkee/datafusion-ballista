@@ -34,7 +34,8 @@ use crate::state::execution_stage::TaskInfo;
 use crate::state::task_manager::JobOverview;
 use ballista_api_types::dto::{
     JobConfig, JobResponse, MemoryConsumerPeak, Percentiles, PlanFormat,
-    QueryStageSummary, QueryStagesResponse, StageMemoryPeak, TaskStatus, TaskSummary,
+    QueryStageSummary, QueryStagesResponse, StageConsumerMemory, StageMemoryPeak,
+    TaskStatus, TaskSummary,
 };
 use ballista_core::serde::protobuf::failed_task::FailedReason::{
     ExecutionError, ExecutorLost, FetchPartitionError, IoError, ResultLost, TaskKilled,
@@ -45,6 +46,7 @@ use datafusion::execution::context::SessionConfig;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::displayable;
 use datafusion::physical_plan::metrics::{MetricsSet, Time};
+use std::collections::HashMap;
 use std::time::Duration;
 
 /// Build the `JobResponse` list entry served by `GET /api/jobs`.
@@ -175,6 +177,7 @@ pub fn graph_to_query_stages(
                 task_input_percentiles: task_input_percentiles(&tasks),
                 task_memory_peak_percentiles: task_memory_peak_percentiles(&tasks),
                 memory_peak_task: memory_peak_task(&tasks),
+                memory_by_consumer: memory_by_consumer(&tasks),
                 tasks,
             }
         })
@@ -240,14 +243,15 @@ fn task_summaries(
                     .memory_usage
                     .as_ref()
                     .map(|usage| usage.pool_peak_bytes),
-                memory_top_consumer: info
+                memory_consumers: info
                     .memory_usage
-                    .as_ref()
-                    .filter(|usage| !usage.top_consumer.is_empty())
-                    .map(|usage| MemoryConsumerPeak {
-                        name: usage.top_consumer.clone(),
-                        peak_bytes: usage.top_consumer_peak_bytes,
-                    }),
+                    .iter()
+                    .flat_map(|usage| &usage.consumers)
+                    .map(|consumer| MemoryConsumerPeak {
+                        name: consumer.name.clone(),
+                        peak_bytes: consumer.peak_bytes,
+                    })
+                    .collect(),
                 status: task_status_to_dto(&info.task_status),
             })
         })
@@ -358,6 +362,58 @@ fn task_memory_peak_percentiles(tasks: &[Option<TaskSummary>]) -> Option<Percent
     )
 }
 
+/// Peak memory of each kind of memory consumer over the stage's finished
+/// tasks, the kind with the largest peak first.
+fn memory_by_consumer(tasks: &[Option<TaskSummary>]) -> Vec<StageConsumerMemory> {
+    let mut peaks_by_kind: HashMap<String, Vec<u64>> = HashMap::new();
+    for consumer in tasks.iter().flatten().flat_map(|t| &t.memory_consumers) {
+        peaks_by_kind
+            .entry(consumer_kind(&consumer.name))
+            .or_default()
+            .push(consumer.peak_bytes);
+    }
+    let mut by_kind: Vec<_> = peaks_by_kind
+        .into_iter()
+        .filter_map(|(name, peaks)| {
+            Some(StageConsumerMemory {
+                name,
+                consumers: peaks.len(),
+                peak_bytes: percentiles_of(peaks)?,
+            })
+        })
+        .collect();
+    by_kind.sort_by(|a, b| {
+        b.peak_bytes
+            .max
+            .cmp(&a.peak_bytes.max)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    by_kind
+}
+
+/// A memory consumer's name without its partition, so that the same operator
+/// on different partitions groups together: `HashJoinInput[3]` becomes
+/// `HashJoinInput` and `ExternalSorter[Merge 2]` becomes
+/// `ExternalSorter[Merge]`. Other bracketed suffixes, such as
+/// `NestedLoopJoinLoad[fallback]`, are kept.
+fn consumer_kind(name: &str) -> String {
+    let Some(inner) = name
+        .strip_suffix(']')
+        .and_then(|rest| rest.rsplit_once('['))
+    else {
+        return name.to_string();
+    };
+    let (prefix, label) = inner;
+    let label_without_partition = label.trim_end_matches(|c: char| c.is_ascii_digit());
+    if label_without_partition.len() == label.len() {
+        return name.to_string();
+    }
+    match label_without_partition.trim_end() {
+        "" => prefix.to_string(),
+        label => format!("{prefix}[{label}]"),
+    }
+}
+
 /// The task that used the largest share of its memory pool. Tasks without a
 /// reported, non-zero pool limit are skipped.
 fn memory_peak_task(tasks: &[Option<TaskSummary>]) -> Option<StageMemoryPeak> {
@@ -372,7 +428,7 @@ fn memory_peak_task(tasks: &[Option<TaskSummary>]) -> Option<StageMemoryPeak> {
                 peak_bytes: peak,
                 pool_limit_bytes: limit,
                 pool_used_percent: peak as f64 * 100.0 / limit as f64,
-                top_consumer: t.memory_top_consumer.clone(),
+                top_consumer: t.memory_consumers.first().cloned(),
             })
         })
         .max_by(|a, b| a.pool_used_percent.total_cmp(&b.pool_used_percent))
@@ -709,8 +765,7 @@ mod tests {
             memory_usage: Some(TaskMemoryUsage {
                 pool_limit_bytes: 2048,
                 pool_peak_bytes: 1500,
-                top_consumer: "HashJoinInput[3]".to_string(),
-                top_consumer_peak_bytes: 1200,
+                consumers: vec![proto_consumer("HashJoinInput[3]", 1200)],
             }),
             ..make_task_info(0, 10)
         };
@@ -721,16 +776,106 @@ mod tests {
         assert_eq!(finished.memory_pool_limit_bytes, Some(2048));
         assert_eq!(finished.memory_pool_peak_bytes, Some(1500));
         assert_eq!(
-            finished.memory_top_consumer,
-            Some(MemoryConsumerPeak {
+            finished.memory_consumers,
+            vec![MemoryConsumerPeak {
                 name: "HashJoinInput[3]".to_string(),
                 peak_bytes: 1200,
-            })
+            }]
         );
         let running = summaries[1].as_ref().unwrap();
         assert_eq!(running.memory_pool_limit_bytes, None);
         assert_eq!(running.memory_pool_peak_bytes, None);
-        assert_eq!(running.memory_top_consumer, None);
+        assert!(running.memory_consumers.is_empty());
+    }
+
+    fn proto_consumer(
+        name: &str,
+        peak_bytes: u64,
+    ) -> ballista_core::serde::protobuf::MemoryConsumerPeak {
+        ballista_core::serde::protobuf::MemoryConsumerPeak {
+            name: name.to_string(),
+            peak_bytes,
+        }
+    }
+
+    /// Consumers group by operator across partitions, so the stage shows
+    /// where its memory went rather than one row per partition.
+    #[test]
+    fn test_memory_by_consumer_groups_partitions_of_each_operator() {
+        let plan = union_plan();
+        let slots = StageMetricSlots::of(plan.as_ref());
+        let with_consumers = |task_id, pool_peak_bytes, consumers| TaskInfo {
+            memory_usage: Some(TaskMemoryUsage {
+                pool_limit_bytes: 4000,
+                pool_peak_bytes,
+                consumers,
+            }),
+            task_id,
+            ..make_task_info(0, 10)
+        };
+        let task_infos = [
+            with_consumers(
+                0,
+                2300,
+                vec![
+                    proto_consumer("HashJoinInput[0]", 2000),
+                    proto_consumer("ExternalSorter[0]", 300),
+                ],
+            ),
+            with_consumers(
+                1,
+                1600,
+                vec![
+                    proto_consumer("HashJoinInput[1]", 1000),
+                    proto_consumer("ExternalSorter[1]", 500),
+                    proto_consumer("ExternalSorter[Merge 1]", 100),
+                ],
+            ),
+            make_task_info(0, 0), // still running, nothing reported
+        ];
+
+        let tasks = task_summaries(&task_infos, &[], &slots);
+        let by_kind: Vec<_> = memory_by_consumer(&tasks)
+            .into_iter()
+            .map(|kind| {
+                (
+                    kind.name,
+                    kind.consumers,
+                    kind.peak_bytes.min,
+                    kind.peak_bytes.max,
+                )
+            })
+            .collect();
+        assert_eq!(
+            by_kind,
+            vec![
+                ("HashJoinInput".to_string(), 2, 1000, 2000),
+                ("ExternalSorter".to_string(), 2, 300, 500),
+                ("ExternalSorter[Merge]".to_string(), 1, 100, 100),
+            ]
+        );
+        assert_eq!(
+            memory_peak_task(&tasks).and_then(|peak| peak.top_consumer),
+            Some(MemoryConsumerPeak {
+                name: "HashJoinInput[0]".to_string(),
+                peak_bytes: 2000,
+            })
+        );
+    }
+
+    #[test]
+    fn test_consumer_kind_drops_only_the_partition() {
+        assert_eq!(consumer_kind("HashJoinInput[3]"), "HashJoinInput");
+        assert_eq!(consumer_kind("HashJoinInput"), "HashJoinInput");
+        assert_eq!(
+            consumer_kind("ExternalSorter[Merge 12]"),
+            "ExternalSorter[Merge]"
+        );
+        assert_eq!(
+            consumer_kind("NestedLoopJoinLoad[fallback]"),
+            "NestedLoopJoinLoad[fallback]"
+        );
+        assert_eq!(consumer_kind("[7]"), "");
     }
 
     /// The stage's memory headroom is the task with the largest share of its

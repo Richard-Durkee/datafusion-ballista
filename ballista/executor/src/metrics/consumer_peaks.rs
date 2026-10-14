@@ -29,6 +29,10 @@ use parking_lot::Mutex;
 /// (an operator's reservation, such as `HashJoinInput[3]`) held at once,
 /// including consumers that have since been dropped.
 ///
+/// Consumers are told apart by name. Reservations that share a name, such as
+/// the ones an operator makes for each of its batches on one partition, count
+/// as one consumer whose peak is the most they held together.
+///
 /// DataFusion's `TrackConsumersPool` forgets a consumer when it unregisters,
 /// so by the time a task finishes it has nothing left to report. This pool
 /// keeps every consumer's peak for as long as the task's runtime lives, so
@@ -37,12 +41,11 @@ use parking_lot::Mutex;
 #[derive(Debug)]
 pub struct ConsumerPeaksPool {
     inner: Arc<dyn MemoryPool>,
-    consumers: Mutex<HashMap<usize, ConsumerPeak>>,
+    consumers: Mutex<HashMap<String, ConsumerPeak>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ConsumerPeak {
-    name: String,
     reserved: usize,
     peak: usize,
 }
@@ -61,27 +64,25 @@ impl ConsumerPeaksPool {
         self.inner.as_ref()
     }
 
-    /// The consumer that held the most memory at once, with that peak in
-    /// bytes. `None` if no consumer has reserved anything.
-    pub fn largest_consumer(&self) -> Option<(String, usize)> {
-        self.consumers
+    /// Every consumer that reserved memory, with the most it held at once in
+    /// bytes, largest first.
+    pub fn consumer_peaks(&self) -> Vec<(String, usize)> {
+        let mut peaks: Vec<_> = self
+            .consumers
             .lock()
-            .values()
-            .filter(|consumer| consumer.peak > 0)
-            .max_by_key(|consumer| consumer.peak)
-            .map(|consumer| (consumer.name.clone(), consumer.peak))
+            .iter()
+            .filter(|(_, consumer)| consumer.peak > 0)
+            .map(|(name, consumer)| (name.clone(), consumer.peak))
+            .collect();
+        peaks.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        peaks
     }
 
     fn record_growth(&self, reservation: &MemoryReservation, additional: usize) {
-        let consumer = reservation.consumer();
         let mut consumers = self.consumers.lock();
         let tracked = consumers
-            .entry(consumer.id())
-            .or_insert_with(|| ConsumerPeak {
-                name: consumer.name().to_string(),
-                reserved: 0,
-                peak: 0,
-            });
+            .entry(reservation.consumer().name().to_string())
+            .or_default();
         tracked.reserved += additional;
         tracked.peak = tracked.peak.max(tracked.reserved);
     }
@@ -103,11 +104,9 @@ impl MemoryPool for ConsumerPeaksPool {
     }
 
     fn unregister(&self, consumer: &MemoryConsumer) {
+        // A reservation frees what it holds, through `shrink`, before it
+        // unregisters, so there is nothing left to account for here.
         self.inner.unregister(consumer);
-        // Keep the peak; only what is still held goes away.
-        if let Some(tracked) = self.consumers.lock().get_mut(&consumer.id()) {
-            tracked.reserved = 0;
-        }
     }
 
     fn grow(&self, reservation: &MemoryReservation, additional: usize) {
@@ -117,7 +116,8 @@ impl MemoryPool for ConsumerPeaksPool {
 
     fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
         self.inner.shrink(reservation, shrink);
-        if let Some(tracked) = self.consumers.lock().get_mut(&reservation.consumer().id())
+        if let Some(tracked) =
+            self.consumers.lock().get_mut(reservation.consumer().name())
         {
             tracked.reserved = tracked.reserved.saturating_sub(shrink);
         }
@@ -149,10 +149,10 @@ mod tests {
         ))))
     }
 
-    fn largest(pool: &Arc<dyn MemoryPool>) -> Option<(String, usize)> {
+    fn peaks(pool: &Arc<dyn MemoryPool>) -> Vec<(String, usize)> {
         pool.downcast_ref::<ConsumerPeaksPool>()
             .unwrap()
-            .largest_consumer()
+            .consumer_peaks()
     }
 
     #[test]
@@ -168,7 +168,13 @@ mod tests {
         drop(sort);
 
         assert_eq!(pool.reserved(), 0);
-        assert_eq!(largest(&pool), Some(("HashJoinInput[3]".to_string(), 600)));
+        assert_eq!(
+            peaks(&pool),
+            vec![
+                ("HashJoinInput[3]".to_string(), 600),
+                ("ExternalSorter[0]".to_string(), 500),
+            ]
+        );
     }
 
     #[test]
@@ -177,13 +183,26 @@ mod tests {
         let reservation = MemoryConsumer::new("a").register(&pool);
         reservation.try_grow(80).unwrap();
         assert!(reservation.try_grow(50).is_err());
-        assert_eq!(largest(&pool), Some(("a".to_string(), 80)));
+        assert_eq!(peaks(&pool), vec![("a".to_string(), 80)]);
+    }
+
+    #[test]
+    fn reservations_with_the_same_name_are_one_consumer() {
+        let pool = pool(1000);
+        let first = MemoryConsumer::new("RepartitionExec[0]").register(&pool);
+        let second = MemoryConsumer::new("RepartitionExec[0]").register(&pool);
+        first.grow(100);
+        second.grow(150);
+        drop(first);
+        second.grow(50);
+
+        assert_eq!(peaks(&pool), vec![("RepartitionExec[0]".to_string(), 250)]);
     }
 
     #[test]
     fn nothing_reserved_reports_no_consumer() {
         let pool = pool(100);
         let _idle = MemoryConsumer::new("idle").register(&pool);
-        assert_eq!(largest(&pool), None);
+        assert!(peaks(&pool).is_empty());
     }
 }

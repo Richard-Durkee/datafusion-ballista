@@ -600,6 +600,7 @@ mod tests {
                 task_input_percentiles: None,
                 task_memory_peak_percentiles: None,
                 memory_peak_task: None,
+                memory_by_consumer: vec![],
                 tasks: vec![],
             }],
         };

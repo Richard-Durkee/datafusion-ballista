@@ -112,10 +112,11 @@ pub struct TaskSummary {
     /// whenever `memory_pool_limit_bytes` is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_pool_peak_bytes: Option<u64>,
-    /// The memory consumer that held the most of the task's pool at once.
-    /// Absent until the task finishes, or if it reserved nothing.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub memory_top_consumer: Option<MemoryConsumerPeak>,
+    /// The task's memory consumers and the most each held at once, largest
+    /// first. Executors report at most the 10 largest. Empty until the task
+    /// finishes, or if it reserved nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_consumers: Vec<MemoryConsumerPeak>,
 }
 
 /// A memory consumer, typically one operator's reservation for one
@@ -130,7 +131,7 @@ pub struct MemoryConsumerPeak {
 }
 
 /// Five-number summary over a stage's tasks, used to spot skew.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct Percentiles {
     /// Smallest observed value.
@@ -143,6 +144,21 @@ pub struct Percentiles {
     pub p75: u64,
     /// Largest observed value.
     pub max: u64,
+}
+
+/// Peak memory of one kind of memory consumer across a stage, such as every
+/// partition's `HashJoinInput[N]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct StageConsumerMemory {
+    /// Consumer name without its partition, such as `HashJoinInput` for
+    /// `HashJoinInput[3]`.
+    pub name: String,
+    /// How many consumers of this kind the stage's finished tasks reported,
+    /// usually one per partition.
+    pub consumers: usize,
+    /// Distribution of their peaks, in bytes.
+    pub peak_bytes: Percentiles,
 }
 
 /// The task in a stage that used the largest share of its memory pool.
@@ -199,6 +215,11 @@ pub struct QueryStageSummary {
     /// stage's memory headroom. Absent until such a task has finished.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_peak_task: Option<StageMemoryPeak>,
+    /// Peak memory of each kind of memory consumer in the stage, the kind
+    /// with the largest peak first. Shows which operators the stage's memory
+    /// went to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_by_consumer: Vec<StageConsumerMemory>,
     /// One entry per task. Always `Some` today; the `Option` predates
     /// multi-partition tasks, when this list was indexed by partition and
     /// could be sparse.
@@ -284,10 +305,10 @@ mod tests {
             output_rows: 10,
             memory_pool_limit_bytes: Some(1024),
             memory_pool_peak_bytes: Some(512),
-            memory_top_consumer: Some(MemoryConsumerPeak {
+            memory_consumers: vec![MemoryConsumerPeak {
                 name: "HashJoinInput[0]".to_string(),
                 peak_bytes: 256,
-            }),
+            }],
         };
         assert_eq!(
             get_schema_property_names::<TaskSummary>(),

@@ -349,6 +349,7 @@ mod tests {
             task_input_percentiles: Some(make_percentiles()),
             task_memory_peak_percentiles: None,
             memory_peak_task: None,
+            memory_by_consumer: vec![],
             tasks: Vec::new(),
         }
     }
@@ -631,7 +632,7 @@ mod tests {
             finish_time: 0,
             memory_pool_limit_bytes: None,
             memory_pool_peak_bytes: None,
-            memory_top_consumer: None,
+            memory_consumers: vec![],
         }
     }
 

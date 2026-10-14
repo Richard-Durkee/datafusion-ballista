@@ -1456,8 +1456,8 @@ impl StageOutput {
 mod tests {
     use super::*;
     use ballista_core::serde::protobuf::{
-        OperatorMetric, SuccessfulTask, TaskColumnStats, TaskStatus, operator_metric,
-        task_status,
+        MemoryConsumerPeak, OperatorMetric, SuccessfulTask, TaskColumnStats, TaskStatus,
+        operator_metric, task_status,
     };
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::prelude::SessionConfig;
@@ -1680,8 +1680,10 @@ mod tests {
         let usage = TaskMemoryUsage {
             pool_limit_bytes: 2048,
             pool_peak_bytes: 1500,
-            top_consumer: "HashJoinInput[0]".to_string(),
-            top_consumer_peak_bytes: 1000,
+            consumers: vec![MemoryConsumerPeak {
+                name: "HashJoinInput[0]".to_string(),
+                peak_bytes: 1000,
+            }],
         };
         let status = TaskStatus {
             memory_usage: Some(usage.clone()),

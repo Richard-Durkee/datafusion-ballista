@@ -410,9 +410,9 @@ pub use standalone::new_standalone_executor_from_state;
 use crate::metrics::ConsumerPeaksPool;
 use crate::shutdown::Shutdown;
 use ballista_core::serde::protobuf::{
-    FailedTask, OperatorMetricsSet, RuntimeStatsReport, ShuffleWritePartition,
-    SuccessfulTask, TaskColumnStats, TaskMemoryUsage, TaskStatus, WindowStateReport,
-    task_status,
+    FailedTask, MemoryConsumerPeak, OperatorMetricsSet, RuntimeStatsReport,
+    ShuffleWritePartition, SuccessfulTask, TaskColumnStats, TaskMemoryUsage, TaskStatus,
+    WindowStateReport, task_status,
 };
 use ballista_core::serde::scheduler::TaskKey;
 use ballista_core::utils::GrpcServerConfig;
@@ -473,8 +473,12 @@ pub struct TaskCompletionExtras {
     pub memory_usage: Option<TaskMemoryUsage>,
 }
 
+/// The most memory consumers a task reports, so that a plan with many
+/// partitions per task can't make status updates arbitrarily large.
+const MAX_REPORTED_MEMORY_CONSUMERS: usize = 10;
+
 /// Reads a task's memory pool limit, peak reservation and largest memory
-/// consumer from its runtime.
+/// consumers from its runtime.
 ///
 /// Returns `None` unless the runtime's pool is a [`ConsumerPeaksPool`] over a
 /// bounded [`PeakRecordingPool`], which is what the executor installs per task
@@ -489,13 +493,18 @@ pub fn task_memory_usage(runtime: &RuntimeEnv) -> Option<TaskMemoryUsage> {
     let MemoryLimit::Finite(limit) = pool.memory_limit() else {
         return None;
     };
-    let (top_consumer, top_consumer_peak_bytes) =
-        consumers.largest_consumer().unwrap_or_default();
     Some(TaskMemoryUsage {
         pool_limit_bytes: limit as u64,
         pool_peak_bytes: pool.max_reserved() as u64,
-        top_consumer,
-        top_consumer_peak_bytes: top_consumer_peak_bytes as u64,
+        consumers: consumers
+            .consumer_peaks()
+            .into_iter()
+            .take(MAX_REPORTED_MEMORY_CONSUMERS)
+            .map(|(name, peak_bytes)| MemoryConsumerPeak {
+                name,
+                peak_bytes: peak_bytes as u64,
+            })
+            .collect(),
     })
 }
 

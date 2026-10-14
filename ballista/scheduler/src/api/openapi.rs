@@ -26,7 +26,7 @@ use axum::Json;
 use axum::response::IntoResponse;
 use ballista_api_types::dto::{
     JobResponse, MemoryConsumerPeak, Percentiles, PlanFormat, QueryStageSummary,
-    QueryStagesResponse, StageMemoryPeak, TaskStatus, TaskSummary,
+    QueryStagesResponse, StageConsumerMemory, StageMemoryPeak, TaskStatus, TaskSummary,
 };
 use ballista_core::serde::scheduler::{
     ExecutorOperatingSystemSpecification, ExecutorSpecification,
@@ -80,6 +80,7 @@ use utoipa::OpenApi;
             Percentiles,
             StageMemoryPeak,
             MemoryConsumerPeak,
+            StageConsumerMemory,
             QueryStageSummary,
             QueryStagesResponse,
             PlanFormat,
@@ -236,6 +237,7 @@ mod tests {
             "Percentiles",
             "StageMemoryPeak",
             "MemoryConsumerPeak",
+            "StageConsumerMemory",
             "QueryStageSummary",
             "QueryStagesResponse",
             "PlanFormat",

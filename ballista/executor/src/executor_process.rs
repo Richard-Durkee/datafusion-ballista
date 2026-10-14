@@ -1562,8 +1562,12 @@ mod memory_pool_tests {
         let usage = crate::task_memory_usage(&env).unwrap();
         assert_eq!(usage.pool_limit_bytes, 2048);
         assert_eq!(usage.pool_peak_bytes, 1500);
-        assert_eq!(usage.top_consumer, "a");
-        assert_eq!(usage.top_consumer_peak_bytes, 1000);
+        let consumers: Vec<_> = usage
+            .consumers
+            .iter()
+            .map(|consumer| (consumer.name.as_str(), consumer.peak_bytes))
+            .collect();
+        assert_eq!(consumers, vec![("a", 1000), ("b", 500)]);
     }
 
     #[test]
