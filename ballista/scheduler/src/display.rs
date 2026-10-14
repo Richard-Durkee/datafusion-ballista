@@ -22,12 +22,14 @@
 use ballista_core::JobId;
 use ballista_core::utils::collect_plan_metrics;
 use datafusion::logical_expr::{StringifiedPlan, ToStringifiedPlan};
-use datafusion::physical_plan::metrics::MetricsSet;
+use datafusion::physical_plan::metrics::{Gauge, Metric, MetricValue, MetricsSet};
 use datafusion::physical_plan::{
     DisplayFormatType, ExecutionPlan, ExecutionPlanVisitor, accept, displayable,
 };
 use log::{debug, error};
+use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 /// Merges executor-collected stage metrics into the plan's metric slots.
 /// Returns None if the lengths don't match, which indicates a mismatch between two collections of metrics
@@ -141,6 +143,36 @@ impl<'a> DisplayableBallistaExecutionPlan<'a> {
     }
 }
 
+/// Combines one operator's metrics from every task of a stage for display.
+///
+/// Counters and timers are summed, as DataFusion does. Peak memory is not:
+/// DataFusion sums it across partitions because they all run at once in one
+/// process, but a stage's partitions run as tasks on different executors and
+/// at different times, so their sum is not a peak that anything reached.
+/// Show the largest partition's peak instead.
+fn aggregate_stage_metrics(metrics: &MetricsSet) -> MetricsSet {
+    let mut peaks = BTreeMap::new();
+    let mut combined = MetricsSet::new();
+    for metric in metrics.iter() {
+        match metric.value() {
+            MetricValue::PeakMemoryUsage { name, gauge } => {
+                let peak = peaks.entry(name.clone()).or_insert(0);
+                *peak = gauge.value().max(*peak);
+            }
+            _ => combined.push(Arc::clone(metric)),
+        }
+    }
+    for (name, peak) in peaks {
+        let gauge = Gauge::new();
+        gauge.add(peak);
+        combined.push(Arc::new(Metric::new(
+            MetricValue::PeakMemoryUsage { name, gauge },
+            None,
+        )));
+    }
+    combined.aggregate_by_name()
+}
+
 /// Formats plans with a single line per node.
 struct IndentVisitor<'a, 'b> {
     /// How to format each node
@@ -164,8 +196,7 @@ impl ExecutionPlanVisitor for IndentVisitor<'_, '_> {
         write!(self.f, "{:indent$}", "", indent = self.indent * 2)?;
         plan.fmt_as(self.t, self.f)?;
         if let Some(metrics) = self.metrics.get(self.metric_index) {
-            let metrics = metrics
-                .aggregate_by_name()
+            let metrics = aggregate_stage_metrics(metrics)
                 .sorted_for_display()
                 .timestamps_removed();
             write!(self.f, ", metrics=[{metrics}]")?;
@@ -190,5 +221,49 @@ impl ToStringifiedPlan for DisplayableBallistaExecutionPlan<'_> {
         plan_type: datafusion::logical_expr::PlanType,
     ) -> StringifiedPlan {
         StringifiedPlan::new(plan_type, self.indent().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::physical_plan::metrics::Count;
+
+    fn peak(name: &'static str, bytes: usize, partition: usize) -> Arc<Metric> {
+        let gauge = Gauge::new();
+        gauge.add(bytes);
+        Arc::new(Metric::new(
+            MetricValue::PeakMemoryUsage {
+                name: name.into(),
+                gauge,
+            },
+            Some(partition),
+        ))
+    }
+
+    fn output_rows(rows: usize, partition: usize) -> Arc<Metric> {
+        let count = Count::new();
+        count.add(rows);
+        Arc::new(Metric::new(MetricValue::OutputRows(count), Some(partition)))
+    }
+
+    #[test]
+    fn stage_peak_memory_is_the_largest_partition_not_the_sum() {
+        let mut metrics = MetricsSet::new();
+        metrics.push(peak("build_mem_used", 300, 0));
+        metrics.push(peak("build_mem_used", 500, 1));
+        metrics.push(peak("build_mem_used", 200, 2));
+        metrics.push(output_rows(10, 0));
+        metrics.push(output_rows(20, 1));
+
+        let combined = aggregate_stage_metrics(&metrics);
+
+        assert_eq!(
+            combined
+                .sum_by_name("build_mem_used")
+                .map(|value| value.as_usize()),
+            Some(500)
+        );
+        assert_eq!(combined.output_rows(), Some(30));
     }
 }

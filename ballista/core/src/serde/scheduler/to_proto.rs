@@ -170,7 +170,7 @@ impl TryInto<operator_metric::Metric> for &MetricValue {
                 }))
             }
             MetricValue::PeakMemoryUsage { name, gauge } => {
-                Ok(operator_metric::Metric::Gauge(NamedGauge {
+                Ok(operator_metric::Metric::PeakMemoryUsage(NamedGauge {
                     name: name.to_string(),
                     value: gauge.value() as u64,
                 }))

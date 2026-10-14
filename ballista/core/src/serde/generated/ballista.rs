@@ -899,7 +899,7 @@ pub struct OperatorMetric {
     pub partition: ::core::option::Option<u32>,
     #[prost(
         oneof = "operator_metric::Metric",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17"
     )]
     pub metric: ::core::option::Option<operator_metric::Metric>,
 }
@@ -937,6 +937,8 @@ pub mod operator_metric {
         Ratio(super::NamedRatio),
         #[prost(uint64, tag = "15")]
         OutputBatches(u64),
+        #[prost(message, tag = "17")]
+        PeakMemoryUsage(super::NamedGauge),
     }
 }
 /// Used by scheduler
