@@ -694,6 +694,7 @@ message OperatorMetric {
     NamedPruningMetrics pruning_metrics = 13;
     NamedRatio ratio = 14;
     uint64 output_batches = 15;
+    NamedGauge peak_memory_usage = 17;
   }
   // Local partition index within the reporting task's plan (0..slice_len-1).
   // The scheduler maps this to a global partition id via the task's

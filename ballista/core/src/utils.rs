@@ -31,11 +31,12 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::context::{SessionConfig, SessionState};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::physical_plan::metrics::MetricsSet;
+use datafusion::physical_plan::metrics::{Gauge, Metric, MetricValue, MetricsSet};
 use datafusion::physical_plan::{ExecutionPlan, RecordBatchStream, metrics};
 use futures::StreamExt;
 use log::{error, info};
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::io::BufWriter;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -444,6 +445,36 @@ pub fn collect_plan_metrics(plan: &dyn ExecutionPlan) -> Vec<MetricsSet> {
     metrics_array
 }
 
+/// Combines one operator's metrics from every task of a stage for display.
+///
+/// Counters and timers are summed, as DataFusion does. Peak memory is not:
+/// DataFusion sums it across partitions because they all run at once in one
+/// process, but a stage's partitions run as tasks on different executors and
+/// at different times, so their sum is not a peak that anything reached.
+/// Show the largest partition's peak instead.
+pub fn aggregate_stage_metrics(metrics: &MetricsSet) -> MetricsSet {
+    let mut peaks = BTreeMap::new();
+    let mut combined = MetricsSet::new();
+    for metric in metrics.iter() {
+        match metric.value() {
+            MetricValue::PeakMemoryUsage { name, gauge } => {
+                let peak = peaks.entry(name.clone()).or_insert(0);
+                *peak = gauge.value().max(*peak);
+            }
+            _ => combined.push(Arc::clone(metric)),
+        }
+    }
+    for (name, peak) in peaks {
+        let gauge = Gauge::new();
+        gauge.add(peak);
+        combined.push(Arc::new(Metric::new(
+            MetricValue::PeakMemoryUsage { name, gauge },
+            None,
+        )));
+    }
+    combined.aggregate_by_name()
+}
+
 /// Given an interval in seconds, get the time in seconds before now
 pub fn get_time_before(interval_seconds: u64) -> u64 {
     let now_epoch_ts = SystemTime::now()
@@ -547,6 +578,7 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::{BinaryViewArray, StringViewArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::metrics::Count;
 
     /// Strings too long to be inlined in their views, so every value lives in
     /// a data buffer.
@@ -744,5 +776,43 @@ mod tests {
 
         let result = create_grpc_server_incoming(addr, &GrpcServerConfig::default());
         assert!(result.is_err());
+    }
+
+    fn peak(name: &'static str, bytes: usize, partition: usize) -> Arc<Metric> {
+        let gauge = Gauge::new();
+        gauge.add(bytes);
+        Arc::new(Metric::new(
+            MetricValue::PeakMemoryUsage {
+                name: name.into(),
+                gauge,
+            },
+            Some(partition),
+        ))
+    }
+
+    fn output_rows(rows: usize, partition: usize) -> Arc<Metric> {
+        let count = Count::new();
+        count.add(rows);
+        Arc::new(Metric::new(MetricValue::OutputRows(count), Some(partition)))
+    }
+
+    #[test]
+    fn stage_peak_memory_is_the_largest_partition_not_the_sum() {
+        let mut metrics = MetricsSet::new();
+        metrics.push(peak("build_mem_used", 300, 0));
+        metrics.push(peak("build_mem_used", 500, 1));
+        metrics.push(peak("build_mem_used", 200, 2));
+        metrics.push(output_rows(10, 0));
+        metrics.push(output_rows(20, 1));
+
+        let combined = aggregate_stage_metrics(&metrics);
+
+        assert_eq!(
+            combined
+                .sum_by_name("build_mem_used")
+                .map(|value| value.as_usize()),
+            Some(500)
+        );
+        assert_eq!(combined.output_rows(), Some(30));
     }
 }

@@ -204,6 +204,14 @@ impl TryInto<MetricValue> for operator_metric::Metric {
                     gauge,
                 })
             }
+            operator_metric::Metric::PeakMemoryUsage(NamedGauge { name, value }) => {
+                let gauge = Gauge::new();
+                gauge.add(value as usize);
+                Ok(MetricValue::PeakMemoryUsage {
+                    name: name.into(),
+                    gauge,
+                })
+            }
             operator_metric::Metric::Time(NamedTime { name, value }) => {
                 let time = Time::new();
                 time.add_duration(Duration::from_nanos(value));
@@ -512,4 +520,28 @@ fn reset_metrics_for_execution_plan(
     })
     .data()
     .map_err(|e| BallistaError::DataFusionError(Box::new(e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peak_memory_usage_survives_serialization() {
+        let gauge = Gauge::new();
+        gauge.add(1024);
+        let metric = MetricValue::PeakMemoryUsage {
+            name: "build_mem_used".into(),
+            gauge,
+        };
+        let proto: operator_metric::Metric = (&metric).try_into().unwrap();
+        let value: MetricValue = proto.try_into().unwrap();
+        match value {
+            MetricValue::PeakMemoryUsage { name, gauge } => {
+                assert_eq!(name, "build_mem_used");
+                assert_eq!(gauge.value(), 1024);
+            }
+            other => panic!("expected PeakMemoryUsage, got {other:?}"),
+        }
+    }
 }

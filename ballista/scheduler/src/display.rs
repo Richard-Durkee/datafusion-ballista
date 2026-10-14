@@ -20,7 +20,7 @@
 //! format
 
 use ballista_core::JobId;
-use ballista_core::utils::collect_plan_metrics;
+use ballista_core::utils::{aggregate_stage_metrics, collect_plan_metrics};
 use datafusion::logical_expr::{StringifiedPlan, ToStringifiedPlan};
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{
@@ -164,8 +164,7 @@ impl ExecutionPlanVisitor for IndentVisitor<'_, '_> {
         write!(self.f, "{:indent$}", "", indent = self.indent * 2)?;
         plan.fmt_as(self.t, self.f)?;
         if let Some(metrics) = self.metrics.get(self.metric_index) {
-            let metrics = metrics
-                .aggregate_by_name()
+            let metrics = aggregate_stage_metrics(metrics)
                 .sorted_for_display()
                 .timestamps_removed();
             write!(self.f, ", metrics=[{metrics}]")?;

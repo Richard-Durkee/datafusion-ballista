@@ -22,7 +22,9 @@ use crate::serde::protobuf::{
     self, GetJobMetricsParams, GetJobMetricsResult,
     scheduler_grpc_client::SchedulerGrpcClient,
 };
-use crate::utils::{GrpcClientConfig, create_grpc_client_endpoint};
+use crate::utils::{
+    GrpcClientConfig, aggregate_stage_metrics, create_grpc_client_endpoint,
+};
 use datafusion::arrow::array::StringBuilder;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -276,8 +278,7 @@ pub(crate) fn format_job_plan(
                         }
                         .try_into()
                         .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
-                    let metrics = metrics_set
-                        .aggregate_by_name()
+                    let metrics = aggregate_stage_metrics(&metrics_set)
                         .sorted_for_display()
                         .timestamps_removed()
                         .to_string();
