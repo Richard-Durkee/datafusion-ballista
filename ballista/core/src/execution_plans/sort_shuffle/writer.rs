@@ -30,10 +30,9 @@ use std::io::{BufWriter, Seek, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
-use super::super::shuffle_writer::{result_schema, summaries_to_batch};
+use super::super::shuffle_writer::{WriterState, execute_handoff, run_coordinator};
 use super::super::shuffle_writer_trait::ShuffleWriter;
 use super::buffer::BufferedBatches;
 use super::config::SortShuffleConfig;
@@ -61,13 +60,12 @@ use datafusion::physical_plan::metrics::{
     self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
 use datafusion::physical_plan::repartition::REPARTITION_RANDOM_STATE;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, Statistics, StatisticsArgs, apply_expression_roots,
     displayable, statistics::ChildStats,
 };
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use log::{debug, warn};
 
 /// Result of finalizing shuffle output: (data_path, index_path, partition_write_stats)
@@ -170,21 +168,6 @@ fn encode_buffered_partitions(
 /// hash partition (0..K) gets one `oneshot::Receiver`; the first `execute(N)`
 /// call spawns the coordinator, subsequent calls take their receiver and
 /// await the summaries for their output partition.
-struct WriterState {
-    initialized: bool,
-    handoffs: Vec<Option<oneshot::Receiver<Result<Vec<ShuffleWritePartition>>>>>,
-    column_null_counts: Vec<u64>,
-}
-
-impl Debug for WriterState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WriterState")
-            .field("initialized", &self.initialized)
-            .field("handoffs", &self.handoffs.len())
-            .finish()
-    }
-}
-
 /// Sort-based shuffle writer that produces a single consolidated output file
 /// per input partition with an index file for partition offsets.
 ///
@@ -309,6 +292,9 @@ pub struct SortShuffleWriterExec {
     /// it spawns per-input-partition write tasks) participates in the
     /// same coordinator.
     state: Arc<Mutex<WriterState>>,
+    /// Per-column null counts over every input partition the task drained,
+    /// published by the coordinator for `execute_query_stage`
+    column_null_counts: Arc<Mutex<Vec<u64>>>,
 }
 
 impl Clone for SortShuffleWriterExec {
@@ -325,6 +311,7 @@ impl Clone for SortShuffleWriterExec {
             metrics: self.metrics.clone(),
             properties: self.properties.clone(),
             state: self.state.clone(),
+            column_null_counts: self.column_null_counts.clone(),
         }
     }
 }
@@ -497,11 +484,8 @@ impl SortShuffleWriterExec {
             global_output_partition_ids: default_partition_slice,
             metrics: ExecutionPlanMetricsSet::new(),
             properties,
-            state: Arc::new(Mutex::new(WriterState {
-                initialized: false,
-                handoffs: (0..output_partition_count).map(|_| None).collect(),
-                column_null_counts: Vec::new(),
-            })),
+            state: Arc::new(Mutex::new(WriterState::new(output_partition_count))),
+            column_null_counts: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -516,9 +500,9 @@ impl SortShuffleWriterExec {
     /// Compute null counts for each column. This will be enhanced in future to add further
     /// col stats for better query planning
     pub fn column_null_counts(&self) -> Vec<u64> {
-        self.state
+        self.column_null_counts
             .lock()
-            .map(|s| s.column_null_counts.clone())
+            .map(|counts| counts.clone())
             .unwrap_or_default()
     }
 
@@ -1021,67 +1005,20 @@ impl ExecutionPlan for SortShuffleWriterExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let schema = result_schema();
-
-        let mut state = self.state.lock().map_err(|_| {
-            DataFusionError::Internal(
-                "SortShuffleWriterExec state mutex poisoned".to_owned(),
-            )
-        })?;
-
-        if !state.initialized {
-            state.initialized = true;
-            let k = state.handoffs.len();
-            let mut senders: Vec<oneshot::Sender<Result<Vec<ShuffleWritePartition>>>> =
-                Vec::with_capacity(k);
-            for slot in state.handoffs.iter_mut() {
-                let (tx, rx) = oneshot::channel();
-                senders.push(tx);
-                *slot = Some(rx);
-            }
-            let writer = self.clone();
-            let ctx = context.clone();
-            tokio::spawn(async move {
-                run_coordinator(writer, ctx, senders).await;
-            });
-        }
-
-        let rx = state
-            .handoffs
-            .get_mut(partition)
-            .and_then(Option::take)
-            .ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "SortShuffleWriterExec: execute({partition}) called twice or out of range (have {} partitions)",
-                    state.handoffs.len()
-                ))
-            })?;
-        drop(state);
-
-        let work_dir = self.work_dir.clone();
-        let job_id = self.job_id.clone();
-        let stage_id = self.stage_id;
-        let schema_captured = schema.clone();
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            futures::stream::once(async move {
-                let summaries = rx.await.map_err(|_| {
-                    DataFusionError::Internal(
-                        "SortShuffleWriterExec coordinator dropped without sending"
-                            .to_owned(),
-                    )
-                })??;
-                summaries_to_batch(
-                    summaries,
-                    schema_captured,
-                    &work_dir,
-                    &job_id,
-                    stage_id,
-                )
-            })
-            .try_flatten(),
-        )))
+        execute_handoff(
+            "SortShuffleWriterExec",
+            &self.state,
+            partition,
+            &self.work_dir,
+            &self.job_id,
+            self.stage_id,
+            |senders| {
+                let writer = self.clone();
+                tokio::spawn(async move {
+                    run_coordinator(write_task(writer, context), senders).await;
+                });
+            },
+        )
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -1126,22 +1063,16 @@ impl ShuffleWriter for SortShuffleWriterExec {
     }
 }
 
-/// Drives per-input-partition writes for the task's restricted plan, then
-/// re-buckets summaries by output partition and sends each bucket's
-/// summaries to the matching oneshot. Runs the M input writes concurrently
-/// (one tokio task each) so shuffle-write parallelism matches what main's
-/// design achieved by having DataFusion drive `execute(0..M)` in parallel.
-///
-/// On failure, sends the error to every sender so no waiting stream hangs.
-async fn run_coordinator(
+/// The task's write work, driven by the shared `run_coordinator`: runs the
+/// per-input-partition writes of the task's restricted plan concurrently
+/// (one tokio task each, so shuffle-write parallelism matches what main's
+/// design achieved by having DataFusion drive `execute(0..M)` in parallel),
+/// then writes the task's single consolidated file and returns one summary
+/// per output partition that received rows, keyed by output partition.
+async fn write_task(
     writer: SortShuffleWriterExec,
     ctx: Arc<TaskContext>,
-    senders: Vec<oneshot::Sender<Result<Vec<ShuffleWritePartition>>>>,
-) {
-    let k = senders.len();
-    let mut senders: Vec<Option<oneshot::Sender<Result<Vec<ShuffleWritePartition>>>>> =
-        senders.into_iter().map(Some).collect();
-
+) -> Result<Vec<(usize, ShuffleWritePartition)>> {
     let num_input_partitions = writer
         .plan
         .properties()
@@ -1158,8 +1089,7 @@ async fn run_coordinator(
         writes.spawn(async move { w.execute_shuffle_write(input_partition, c).await });
     }
 
-    let mut grouped: Vec<Vec<ShuffleWritePartition>> =
-        (0..k).map(|_| Vec::new()).collect();
+    let mut summaries: Vec<(usize, ShuffleWritePartition)> = Vec::new();
     let mut outputs: Vec<InputPartitionOutput> = Vec::with_capacity(num_input_partitions);
     let mut first_error: Option<DataFusionError> = None;
     while let Some(joined) = writes.join_next().await {
@@ -1180,7 +1110,7 @@ async fn run_coordinator(
     writes.abort_all();
 
     // Fold each input partition's per-column null counts into the task-level
-    // total and publish it on the shared state for `execute_query_stage`.
+    // total and publish it for `execute_query_stage`.
     let mut column_null_counts: Vec<u64> = Vec::new();
     for output in outputs.iter() {
         if column_null_counts.len() < output.null_counts.len() {
@@ -1190,8 +1120,8 @@ async fn run_coordinator(
             *slot += n;
         }
     }
-    if let Ok(mut state) = writer.state.lock() {
-        state.column_null_counts = column_null_counts;
+    if let Ok(mut counts) = writer.column_null_counts.lock() {
+        *counts = column_null_counts;
     }
 
     // Every input partition has finished bucketing; emit the task's single
@@ -1234,15 +1164,18 @@ async fn run_coordinator(
                     total_rows,
                 );
                 for (part_id, num_batches, num_rows, num_bytes) in partition_stats {
-                    if num_rows > 0 && part_id < k {
-                        grouped[part_id].push(ShuffleWritePartition {
-                            partition_id: part_id as u64,
-                            num_batches,
-                            num_rows,
-                            num_bytes,
-                            file_id: Some(file_id),
-                            is_sort_shuffle: true,
-                        });
+                    if num_rows > 0 {
+                        summaries.push((
+                            part_id,
+                            ShuffleWritePartition {
+                                partition_id: part_id as u64,
+                                num_batches,
+                                num_rows,
+                                num_bytes,
+                                file_id: Some(file_id),
+                                is_sort_shuffle: true,
+                            },
+                        ));
                     }
                 }
             }
@@ -1258,23 +1191,9 @@ async fn run_coordinator(
         }
     }
 
-    if let Some(e) = first_error {
-        // Share the original error with every output handoff so classification
-        // preserves FetchFailed/IO details regardless of stream completion order.
-        let shared = Arc::new(e);
-        for slot in senders.iter_mut() {
-            if let Some(sender) = slot.take() {
-                let err = DataFusionError::from(&shared);
-                let _ = sender.send(Err(err));
-            }
-        }
-        return;
-    }
-
-    for (slot, bucket) in senders.iter_mut().zip(grouped) {
-        if let Some(sender) = slot.take() {
-            let _ = sender.send(Ok(bucket));
-        }
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(summaries),
     }
 }
 
@@ -1427,6 +1346,7 @@ mod tests {
     use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion::physical_plan::expressions::Column;
     use datafusion::prelude::SessionContext;
+    use futures::TryStreamExt;
     use tempfile::TempDir;
 
     fn create_test_input() -> Result<Arc<dyn ExecutionPlan>> {

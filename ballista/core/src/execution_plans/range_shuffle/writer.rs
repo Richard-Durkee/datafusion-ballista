@@ -29,23 +29,20 @@ use datafusion::execution::context::TaskContext;
 use datafusion::physical_expr::{LexOrdering, PhysicalExpr};
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
     PlanProperties, SendableRecordBatchStream, Statistics, StatisticsArgs,
     statistics::ChildStats,
 };
-use futures::TryStreamExt;
 use log::debug;
-use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
 use crate::JobId;
 use crate::error::BallistaError;
 use crate::execution_plans::create_shuffle_path;
 use crate::execution_plans::shuffle_writer::{
-    ShuffleWriteMetrics, WriterState, collect_window_state_operators, result_schema,
-    run_coordinator, summaries_to_batch,
+    ShuffleWriteMetrics, WriterState, collect_window_state_operators, execute_handoff,
+    run_coordinator,
 };
 use crate::execution_plans::shuffle_writer_trait::ShuffleWriter;
 use crate::execution_plans::{ObservedWindowState, PartitionedBoundedWindowAggExec};
@@ -183,10 +180,7 @@ impl RangeShuffleWriterExec {
             task_id: 0,
             metrics: ExecutionPlanMetricsSet::new(),
             properties,
-            state: Arc::new(Mutex::new(WriterState {
-                initialized: false,
-                handoffs: (0..output_partition_count).map(|_| None).collect(),
-            })),
+            state: Arc::new(Mutex::new(WriterState::new(output_partition_count))),
         })
     }
 
@@ -437,67 +431,20 @@ impl ExecutionPlan for RangeShuffleWriterExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let schema = result_schema();
-
-        let mut state = self.state.lock().map_err(|_| {
-            DataFusionError::Internal(
-                "RangeShuffleWriterExec state mutex poisoned".to_owned(),
-            )
-        })?;
-
-        if !state.initialized {
-            state.initialized = true;
-            let k = state.handoffs.len();
-            let mut senders: Vec<oneshot::Sender<Result<Vec<ShuffleWritePartition>>>> =
-                Vec::with_capacity(k);
-            for slot in state.handoffs.iter_mut() {
-                let (tx, rx) = oneshot::channel();
-                senders.push(tx);
-                *slot = Some(rx);
-            }
-            let writer = self.clone();
-            let ctx = context.clone();
-            tokio::spawn(async move {
-                run_coordinator(writer.execute_shuffle_write(ctx), senders).await;
-            });
-        }
-
-        let rx = state
-            .handoffs
-            .get_mut(partition)
-            .and_then(Option::take)
-            .ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "RangeShuffleWriterExec: execute({partition}) called twice or out of range (have {} partitions)",
-                    state.handoffs.len()
-                ))
-            })?;
-        drop(state);
-
-        let work_dir = self.work_dir.clone();
-        let job_id = self.job_id.clone();
-        let stage_id = self.stage_id;
-        let schema_captured = schema.clone();
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            futures::stream::once(async move {
-                let summaries = rx.await.map_err(|_| {
-                    DataFusionError::Internal(
-                        "RangeShuffleWriterExec coordinator dropped without sending"
-                            .to_owned(),
-                    )
-                })??;
-                summaries_to_batch(
-                    summaries,
-                    schema_captured,
-                    &work_dir,
-                    &job_id,
-                    stage_id,
-                )
-            })
-            .try_flatten(),
-        )))
+        execute_handoff(
+            "RangeShuffleWriterExec",
+            &self.state,
+            partition,
+            &self.work_dir,
+            &self.job_id,
+            self.stage_id,
+            |senders| {
+                let writer = self.clone();
+                tokio::spawn(async move {
+                    run_coordinator(writer.execute_shuffle_write(context), senders).await;
+                });
+            },
+        )
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

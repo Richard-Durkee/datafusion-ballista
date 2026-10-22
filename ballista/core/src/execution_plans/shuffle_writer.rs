@@ -236,6 +236,17 @@ pub(crate) struct WriterState {
         Vec<Option<oneshot::Receiver<Result<Vec<ShuffleWritePartition>>>>>,
 }
 
+impl WriterState {
+    /// One empty handoff slot per output partition; the first `execute`
+    /// call fills them (see [`execute_handoff`]).
+    pub(crate) fn new(output_partition_count: usize) -> Self {
+        Self {
+            initialized: false,
+            handoffs: (0..output_partition_count).map(|_| None).collect(),
+        }
+    }
+}
+
 impl Debug for WriterState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WriterState")
@@ -468,10 +479,7 @@ impl ShuffleWriterExec {
             global_output_partition_ids: default_partition_slice,
             metrics: ExecutionPlanMetricsSet::new(),
             properties,
-            state: Arc::new(Mutex::new(WriterState {
-                initialized: false,
-                handoffs: (0..output_partition_count).map(|_| None).collect(),
-            })),
+            state: Arc::new(Mutex::new(WriterState::new(output_partition_count))),
         })
     }
 
@@ -747,65 +755,20 @@ impl ExecutionPlan for ShuffleWriterExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let schema = result_schema();
-
-        let mut state = self.state.lock().map_err(|_| {
-            DataFusionError::Internal("ShuffleWriterExec state mutex poisoned".to_owned())
-        })?;
-
-        if !state.initialized {
-            state.initialized = true;
-            let k = state.handoffs.len();
-            let mut senders: Vec<oneshot::Sender<Result<Vec<ShuffleWritePartition>>>> =
-                Vec::with_capacity(k);
-            for slot in state.handoffs.iter_mut() {
-                let (tx, rx) = oneshot::channel();
-                senders.push(tx);
-                *slot = Some(rx);
-            }
-            let writer = self.clone();
-            let ctx = context.clone();
-            tokio::spawn(async move {
-                run_coordinator(writer.execute_shuffle_write(ctx), senders).await;
-            });
-        }
-
-        let rx = state
-            .handoffs
-            .get_mut(partition)
-            .and_then(Option::take)
-            .ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "ShuffleWriterExec: execute({partition}) called twice or out of range (have {} partitions)",
-                    state.handoffs.len()
-                ))
-            })?;
-        drop(state);
-
-        let work_dir = self.work_dir.clone();
-        let job_id = self.job_id.clone();
-        let stage_id = self.stage_id;
-        let schema_captured = schema.clone();
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            futures::stream::once(async move {
-                let summaries = rx.await.map_err(|_| {
-                    DataFusionError::Internal(
-                        "ShuffleWriterExec coordinator dropped without sending"
-                            .to_owned(),
-                    )
-                })??;
-                summaries_to_batch(
-                    summaries,
-                    schema_captured,
-                    &work_dir,
-                    &job_id,
-                    stage_id,
-                )
-            })
-            .try_flatten(),
-        )))
+        execute_handoff(
+            "ShuffleWriterExec",
+            &self.state,
+            partition,
+            &self.work_dir,
+            &self.job_id,
+            self.stage_id,
+            |senders| {
+                let writer = self.clone();
+                tokio::spawn(async move {
+                    run_coordinator(writer.execute_shuffle_write(context), senders).await;
+                });
+            },
+        )
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -864,6 +827,74 @@ pub(crate) fn result_schema() -> SchemaRef {
         Field::new("file_id", DataType::UInt64, true),
         stats.arrow_struct_repr(),
     ]))
+}
+
+/// The `execute(N)` half of the handoff every shuffle writer shares. One
+/// Ballista task holds one writer. The first `execute` call creates the K
+/// oneshot channels, stores their receivers in `state` and hands the senders
+/// to `spawn_coordinator`, which starts the writer-specific coordinator (a
+/// [`run_coordinator`] over the writer's own write work). Every call,
+/// including the first, then takes its partition's receiver and returns a
+/// stream that yields partition N's metadata batch once the coordinator has
+/// sent its summaries.
+///
+/// `writer_name` only labels the errors: a poisoned state mutex, an
+/// `execute(N)` called twice or out of range, and a coordinator that ended
+/// without sending.
+pub(crate) fn execute_handoff(
+    writer_name: &str,
+    state: &Mutex<WriterState>,
+    partition: usize,
+    work_dir: &str,
+    job_id: &JobId,
+    stage_id: usize,
+    spawn_coordinator: impl FnOnce(Vec<oneshot::Sender<Result<Vec<ShuffleWritePartition>>>>),
+) -> Result<SendableRecordBatchStream> {
+    let schema = result_schema();
+
+    let mut state = state.lock().map_err(|_| {
+        DataFusionError::Internal(format!("{writer_name} state mutex poisoned"))
+    })?;
+
+    if !state.initialized {
+        state.initialized = true;
+        let k = state.handoffs.len();
+        let mut senders: Vec<oneshot::Sender<Result<Vec<ShuffleWritePartition>>>> =
+            Vec::with_capacity(k);
+        for slot in state.handoffs.iter_mut() {
+            let (tx, rx) = oneshot::channel();
+            senders.push(tx);
+            *slot = Some(rx);
+        }
+        spawn_coordinator(senders);
+    }
+
+    let rx = state
+        .handoffs
+        .get_mut(partition)
+        .and_then(Option::take)
+        .ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "{writer_name}: execute({partition}) called twice or out of range (have {} partitions)",
+                state.handoffs.len()
+            ))
+        })?;
+    drop(state);
+
+    let work_dir = work_dir.to_owned();
+    let job_id = job_id.clone();
+    let dropped = format!("{writer_name} coordinator dropped without sending");
+    let schema_captured = schema.clone();
+
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        futures::stream::once(async move {
+            let summaries =
+                rx.await.map_err(|_| DataFusionError::Internal(dropped))??;
+            summaries_to_batch(summaries, schema_captured, &work_dir, &job_id, stage_id)
+        })
+        .try_flatten(),
+    )))
 }
 
 /// Drives the shared write work for all K output partitions. Awaits
