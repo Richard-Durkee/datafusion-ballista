@@ -27,6 +27,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::execution::TaskContext;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_plan::expressions::col;
 use datafusion::physical_plan::{ExecutionPlan, Partitioning};
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -222,6 +223,9 @@ async fn hash_exchange_delivers_every_row_to_exactly_one_partition() {
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(stats[&(p as u64)], rows as u64);
     }
+    // Once everything is read, neither the coalescers nor the queues hold
+    // anything.
+    assert_eq!(ctx.memory_pool().reserved(), 0);
 }
 
 #[tokio::test]
@@ -329,6 +333,79 @@ async fn broadcast_outputs_replay_to_every_consumer_task() {
         all.sort_unstable();
         assert_eq!(all, (0..20).collect::<Vec<_>>());
     }
+}
+
+#[tokio::test]
+async fn queued_batches_are_reserved_until_the_consumer_takes_them() {
+    let registry = Arc::new(PipelinedRegistry::new(EXECUTOR));
+    let batches = vec![batch(0..10), batch(10..20), batch(20..30)];
+    let size: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+    let writer = writer(0, input(vec![batches]), None, false);
+    let reader = PipelinedShuffleReaderExec::try_new(
+        STAGE,
+        vec![vec![location(0, 0)]],
+        schema(),
+        Partitioning::UnknownPartitioning(1),
+    )
+    .unwrap();
+
+    // The queue holds every batch, so the producer finishes before anyone
+    // reads.
+    let ctx = task_ctx(&registry, Some(4));
+    writer.execute_pipelined(ctx.clone()).await.unwrap();
+    assert_eq!(ctx.memory_pool().reserved(), size);
+
+    let read = read_partition(&reader, 0, ctx.clone()).await.unwrap();
+    assert_eq!(keys(&read), (0..30).collect::<Vec<_>>());
+    assert_eq!(ctx.memory_pool().reserved(), 0);
+}
+
+#[tokio::test]
+async fn broadcast_outputs_are_reserved_until_their_stage_is_removed() {
+    let registry = Arc::new(PipelinedRegistry::new(EXECUTOR));
+    let batches = vec![batch(0..10), batch(10..20)];
+    let size: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+    let writer = writer(0, input(vec![batches]), None, true);
+    let reader =
+        PipelinedShuffleReaderExec::new_broadcast(STAGE, vec![location(0, 0)], schema());
+
+    let ctx = task_ctx(&registry, None);
+    writer.execute_pipelined(ctx.clone()).await.unwrap();
+    read_partition(&reader, 0, ctx.clone()).await.unwrap();
+    // Read in full, but kept for any consumer still to come.
+    assert_eq!(ctx.memory_pool().reserved(), size);
+
+    registry.remove_stage(&"job".into(), STAGE);
+    assert_eq!(ctx.memory_pool().reserved(), 0);
+}
+
+#[tokio::test]
+async fn broadcast_output_larger_than_the_task_memory_fails_the_producer() {
+    let registry = Arc::new(PipelinedRegistry::new(EXECUTOR));
+    let writer = writer(0, input(vec![vec![batch(0..1000)]]), None, true);
+    let reader =
+        PipelinedShuffleReaderExec::new_broadcast(STAGE, vec![location(0, 0)], schema());
+
+    let config = SessionConfig::new_with_ballista().with_extension(registry);
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_limit(1024, 1.0)
+        .build_arc()
+        .unwrap();
+    let ctx = SessionContext::new_with_config_rt(config, runtime).task_ctx();
+
+    let err = writer
+        .execute_pipelined(ctx.clone())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("PipelinedBroadcast[0]"), "{err}");
+    // The consumer fails with the cause instead of seeing a truncated build
+    // side.
+    let err = read_partition(&reader, 0, ctx)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("PipelinedBroadcast[0]"), "{err}");
 }
 
 #[tokio::test]

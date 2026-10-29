@@ -26,6 +26,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::TaskContext;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::metrics::{
     self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
@@ -223,6 +224,7 @@ impl PipelinedShuffleWriterExec {
             capacity,
             compression,
             ballista_config.pipelined_registration_timeout(),
+            context.memory_pool(),
         );
         let key = TaskKey {
             job_id: self.job_id.clone(),
@@ -234,8 +236,11 @@ impl PipelinedShuffleWriterExec {
             "pipelined producer {key} serving partitions {output_ids:?} from {num_inputs} inputs"
         );
 
-        let coalesce =
-            matches!(routing, Routing::Hash(_)).then_some((schema, batch_size));
+        let coalesce = matches!(routing, Routing::Hash(_)).then_some((
+            schema,
+            batch_size,
+            context.memory_pool(),
+        ));
         let outputs = Arc::new(Outputs::new(output_ids, sinks, coalesce));
 
         let result = match self
@@ -348,18 +353,25 @@ struct Outputs {
 
 impl Outputs {
     /// Pairs `ids` with their `sinks`, given in the same order. `coalesce`
-    /// gives the schema and batch size when the outputs are hashed into.
+    /// gives the schema, batch size and the task's memory pool when the
+    /// outputs are hashed into.
     fn new(
         ids: Vec<usize>,
         sinks: Vec<PartitionSink>,
-        coalesce: Option<(SchemaRef, usize)>,
+        coalesce: Option<(SchemaRef, usize, &Arc<dyn MemoryPool>)>,
     ) -> Self {
         let slots = ids
             .into_iter()
             .zip(sinks)
             .map(|(id, sink)| {
-                let coalescer = coalesce.as_ref().map(|(schema, batch_size)| {
-                    Mutex::new(BatchCoalescer::new(schema.clone(), *batch_size))
+                let coalescer = coalesce.as_ref().map(|(schema, batch_size, pool)| {
+                    Mutex::new(Coalescer {
+                        batches: BatchCoalescer::new(schema.clone(), *batch_size),
+                        reservation: MemoryConsumer::new(format!(
+                            "PipelinedCoalescer[{id}]"
+                        ))
+                        .register(pool),
+                    })
                 });
                 Output::new(id, sink, coalescer)
             })
@@ -401,7 +413,7 @@ struct Output {
     /// Hash routing only: the rows routed here, coalesced back up to the
     /// batch size before they are sent. Passthrough sends input batches as
     /// they are.
-    coalescer: Option<Mutex<BatchCoalescer>>,
+    coalescer: Option<Mutex<Coalescer>>,
     /// Cleared once the consumer has gone away.
     open: AtomicBool,
     rows: AtomicU64,
@@ -410,11 +422,7 @@ struct Output {
 }
 
 impl Output {
-    fn new(
-        id: usize,
-        sink: PartitionSink,
-        coalescer: Option<Mutex<BatchCoalescer>>,
-    ) -> Self {
+    fn new(id: usize, sink: PartitionSink, coalescer: Option<Mutex<Coalescer>>) -> Self {
         Self {
             id,
             sink,
@@ -441,8 +449,8 @@ impl Output {
             Some(coalescer) => {
                 let ready = {
                     let mut coalescer = coalescer.lock().unwrap();
-                    coalescer.push_batch(batch)?;
-                    drain(&mut coalescer)
+                    coalescer.batches.push_batch(batch)?;
+                    coalescer.drain()
                 };
                 for batch in ready {
                     self.send(batch).await?;
@@ -459,8 +467,8 @@ impl Output {
         if let Some(coalescer) = &self.coalescer {
             let ready = {
                 let mut coalescer = coalescer.lock().unwrap();
-                coalescer.finish_buffered_batch()?;
-                drain(&mut coalescer)
+                coalescer.batches.finish_buffered_batch()?;
+                coalescer.drain()
             };
             for batch in ready {
                 self.send(batch).await?;
@@ -488,12 +496,25 @@ impl Output {
     }
 }
 
-fn drain(coalescer: &mut BatchCoalescer) -> Vec<RecordBatch> {
-    let mut ready = vec![];
-    while let Some(batch) = coalescer.next_completed_batch() {
-        ready.push(batch);
+/// An output's coalescer, with the memory it holds in the task's pool.
+struct Coalescer {
+    batches: BatchCoalescer,
+    reservation: MemoryReservation,
+}
+
+impl Coalescer {
+    /// Takes the completed batches, leaving the reservation at what the
+    /// coalescer still buffers. The batches taken are reserved again once
+    /// they are queued.
+    fn drain(&mut self) -> Vec<RecordBatch> {
+        let mut ready = vec![];
+        while let Some(batch) = self.batches.next_completed_batch() {
+            ready.push(batch);
+        }
+        // Bounded by the batch size, so this accounts rather than refuses.
+        self.reservation.resize(self.batches.size());
+        ready
     }
-    ready
 }
 
 async fn drive_hashed(

@@ -37,6 +37,12 @@
 //! A producer stays registered until the executor removes its stage or job,
 //! which the scheduler asks for as each finishes. Queue partitions are small
 //! once claimed; broadcast partitions keep their batches until then.
+//!
+//! Every batch an output holds is reserved from the producer task's memory
+//! pool. A queued batch's reservation travels with it and is released when the
+//! consumer takes it, whether it then reads it in-process or sends it over
+//! Flight. A broadcast output's reservation is released when its producer is
+//! removed.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,6 +53,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::ipc::CompressionType;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::Stream;
@@ -67,7 +74,9 @@ const CLOSED_JOB_MEMORY: usize = 1024;
 /// A message on a single-consumer output queue.
 #[derive(Debug)]
 pub(crate) enum Message {
-    Batch(RecordBatch),
+    /// A batch, with the memory it holds in the producer's pool until the
+    /// consumer takes it.
+    Batch(RecordBatch, MemoryReservation),
     /// The partition is complete. A queue that closes without this marker
     /// belongs to a producer that failed or was cancelled.
     End,
@@ -123,13 +132,18 @@ impl PartitionSink {
         match self {
             PartitionSink::Queue(queue) => match queue.reserve().await? {
                 Some(permit) => {
-                    permit.send(Message::Batch(batch));
+                    // The queue's capacity bounds what it holds, so this
+                    // only accounts for the batch rather than refusing it.
+                    let size = batch.get_array_memory_size();
+                    queue.reservation.grow(size);
+                    let held = queue.reservation.split(size);
+                    permit.send(Message::Batch(batch, held));
                     Ok(true)
                 }
                 None => Ok(false),
             },
             PartitionSink::Replay(sink) => {
-                sink.buffer.push(batch);
+                sink.buffer.push(batch)?;
                 Ok(true)
             }
         }
@@ -158,6 +172,8 @@ pub(crate) struct QueueSink {
     claim_timeout: Duration,
     /// When the producer stops waiting on a full queue nobody has claimed.
     claim_deadline: tokio::time::Instant,
+    /// Empty itself: each queued batch carries a split of it.
+    reservation: MemoryReservation,
 }
 
 impl QueueSink {
@@ -197,6 +213,10 @@ impl ProducerOutputs {
     ///
     /// A producer waits on a full queue that no consumer has opened only
     /// until `claim_timeout` from now; then its send fails.
+    ///
+    /// The batches every output holds are reserved from `pool`, the producer
+    /// task's memory pool. A broadcast output that cannot grow its
+    /// reservation fails the producer.
     pub(crate) fn new(
         schema: SchemaRef,
         partitions: impl IntoIterator<Item = usize>,
@@ -204,13 +224,17 @@ impl ProducerOutputs {
         capacity: usize,
         compression: Option<CompressionType>,
         claim_timeout: Duration,
+        pool: &Arc<dyn MemoryPool>,
     ) -> (Arc<Self>, Vec<PartitionSink>) {
         let claim_deadline = tokio::time::Instant::now() + claim_timeout;
         let mut outputs = HashMap::new();
         let mut sinks = Vec::new();
         for partition in partitions {
             if broadcast {
-                let buffer = Arc::new(ReplayBuffer::default());
+                let reservation =
+                    MemoryConsumer::new(format!("PipelinedBroadcast[{partition}]"))
+                        .register(pool);
+                let buffer = Arc::new(ReplayBuffer::new(reservation));
                 outputs.insert(partition, PartitionOutput::Replay(buffer.clone()));
                 sinks.push(PartitionSink::Replay(ReplaySink { buffer }));
             } else {
@@ -229,6 +253,10 @@ impl ProducerOutputs {
                     claimed,
                     claim_timeout,
                     claim_deadline,
+                    reservation: MemoryConsumer::new(format!(
+                        "PipelinedQueue[{partition}]"
+                    ))
+                    .register(pool),
                 }));
             }
         }
@@ -555,7 +583,10 @@ fn queue_stream(
     futures::stream::unfold(Some((rx, outputs, key)), move |state| async move {
         let (mut rx, outputs, key) = state?;
         match rx.recv().await {
-            Some(Message::Batch(batch)) => Some((Ok(batch), Some((rx, outputs, key)))),
+            // Dropping `_held` releases the batch from the producer's pool.
+            Some(Message::Batch(batch, _held)) => {
+                Some((Ok(batch), Some((rx, outputs, key))))
+            }
             Some(Message::End) => None,
             None => Some((Err(outputs.stopped_early(&key, partition)), None)),
         }
@@ -566,14 +597,8 @@ fn queue_stream(
 /// consumers that read it from the start.
 pub(crate) struct ReplayBuffer {
     state: watch::Sender<ReplayState>,
-}
-
-impl Default for ReplayBuffer {
-    fn default() -> Self {
-        Self {
-            state: watch::Sender::new(ReplayState::default()),
-        }
-    }
+    /// The memory `state.batches` holds, released when the buffer is dropped.
+    reservation: MemoryReservation,
 }
 
 #[derive(Default)]
@@ -592,8 +617,19 @@ enum ReplayEnd {
 }
 
 impl ReplayBuffer {
-    fn push(&self, batch: RecordBatch) {
+    fn new(reservation: MemoryReservation) -> Self {
+        Self {
+            state: watch::Sender::new(ReplayState::default()),
+            reservation,
+        }
+    }
+
+    /// Keeps `batch` for replay. Fails if the producer's pool cannot hold it,
+    /// which bounds a broadcast output the planner sized wrong.
+    fn push(&self, batch: RecordBatch) -> Result<()> {
+        self.reservation.try_grow(batch.get_array_memory_size())?;
         self.state.send_modify(|state| state.batches.push(batch));
+        Ok(())
     }
 
     fn end(&self, end: ReplayEnd) {
@@ -664,6 +700,7 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::Int32Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::execution::memory_pool::UnboundedMemoryPool;
     use futures::TryStreamExt;
 
     fn schema() -> SchemaRef {
@@ -703,14 +740,25 @@ mod tests {
 
     const WAIT: Duration = Duration::from_secs(5);
 
+    fn pool() -> Arc<dyn MemoryPool> {
+        Arc::new(UnboundedMemoryPool::default())
+    }
+
     /// The outputs of a producer serving the single queue partition 0, with
     /// its sink.
     fn queue(
         capacity: usize,
         claim_timeout: Duration,
     ) -> (Arc<ProducerOutputs>, PartitionSink) {
-        let (outputs, mut sinks) =
-            ProducerOutputs::new(schema(), [0], false, capacity, None, claim_timeout);
+        let (outputs, mut sinks) = ProducerOutputs::new(
+            schema(),
+            [0],
+            false,
+            capacity,
+            None,
+            claim_timeout,
+            &pool(),
+        );
         (outputs, sinks.remove(0))
     }
 
@@ -718,7 +766,7 @@ mod tests {
     /// with its sink.
     fn broadcast() -> (Arc<ProducerOutputs>, PartitionSink) {
         let (outputs, mut sinks) =
-            ProducerOutputs::new(schema(), [0], true, 1, None, WAIT);
+            ProducerOutputs::new(schema(), [0], true, 1, None, WAIT, &pool());
         (outputs, sinks.remove(0))
     }
 
@@ -736,7 +784,7 @@ mod tests {
         tokio::task::yield_now().await;
 
         let (outputs, mut sinks) =
-            ProducerOutputs::new(schema(), [3], false, 2, None, WAIT);
+            ProducerOutputs::new(schema(), [3], false, 2, None, WAIT, &pool());
         registry.register(key(0), outputs).unwrap();
         let sink = sinks.remove(0);
         assert!(sink.send(batch(&[1, 2])).await.unwrap());
