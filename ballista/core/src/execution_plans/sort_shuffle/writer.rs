@@ -30,11 +30,10 @@ use std::io::{BufWriter, Seek, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
 use super::super::shuffle_writer::{
-    ColumnStatsCollector, WriterState, handoff_stream, sketched_columns,
+    ColumnStatsCollector, WriterState, handoff_stream, run_coordinator, sketched_columns,
 };
 use super::super::shuffle_writer_trait::ShuffleWriter;
 use super::buffer::BufferedBatches;
@@ -1138,7 +1137,7 @@ impl ExecutionPlan for SortShuffleWriterExec {
             .take_handoff("SortShuffleWriterExec", partition, |senders| {
                 let writer = self.clone();
                 SpawnedTask::spawn(async move {
-                    run_coordinator(writer, context, senders).await;
+                    run_coordinator(write_task(writer, context), senders).await;
                 })
             })?;
 
@@ -1214,22 +1213,16 @@ impl ShuffleWriter for SortShuffleWriterExec {
     }
 }
 
-/// Drives per-input-partition writes for the task's restricted plan, then
-/// re-buckets summaries by output partition and sends each bucket's
-/// summaries to the matching oneshot. Runs the M input writes concurrently
-/// (one tokio task each) so shuffle-write parallelism matches what main's
-/// design achieved by having DataFusion drive `execute(0..M)` in parallel.
-///
-/// On failure, sends the error to every sender so no waiting stream hangs.
-async fn run_coordinator(
+/// The task's write work, driven by the shared `run_coordinator`: runs the
+/// per-input-partition writes of the task's restricted plan concurrently
+/// (one tokio task each, so shuffle-write parallelism matches what main's
+/// design achieved by having DataFusion drive `execute(0..M)` in parallel),
+/// then writes the task's single consolidated file and returns one summary
+/// per output partition that received rows, keyed by output partition.
+async fn write_task(
     writer: SortShuffleWriterExec,
     ctx: Arc<TaskContext>,
-    senders: Vec<oneshot::Sender<Result<Vec<ShuffleWritePartition>>>>,
-) {
-    let k = senders.len();
-    let mut senders: Vec<Option<oneshot::Sender<Result<Vec<ShuffleWritePartition>>>>> =
-        senders.into_iter().map(Some).collect();
-
+) -> Result<Vec<(usize, ShuffleWritePartition)>> {
     let num_input_partitions = writer
         .plan
         .properties()
@@ -1261,8 +1254,7 @@ async fn run_coordinator(
         writes.spawn(async move { w.execute_shuffle_write(input_partition, c).await });
     }
 
-    let mut grouped: Vec<Vec<ShuffleWritePartition>> =
-        (0..k).map(|_| Vec::new()).collect();
+    let mut summaries: Vec<(usize, ShuffleWritePartition)> = Vec::new();
     let mut outputs: Vec<InputPartitionOutput> = Vec::with_capacity(num_input_partitions);
     let mut first_error: Option<DataFusionError> = None;
     while let Some(joined) = writes.join_next().await {
@@ -1322,15 +1314,18 @@ async fn run_coordinator(
                     total_rows,
                 );
                 for (part_id, num_batches, num_rows, num_bytes) in partition_stats {
-                    if num_rows > 0 && part_id < k {
-                        grouped[part_id].push(ShuffleWritePartition {
-                            partition_id: part_id as u64,
-                            num_batches,
-                            num_rows,
-                            num_bytes,
-                            file_id: Some(file_id),
-                            is_sort_shuffle: true,
-                        });
+                    if num_rows > 0 {
+                        summaries.push((
+                            part_id,
+                            ShuffleWritePartition {
+                                partition_id: part_id as u64,
+                                num_batches,
+                                num_rows,
+                                num_bytes,
+                                file_id: Some(file_id),
+                                is_sort_shuffle: true,
+                            },
+                        ));
                     }
                 }
             }
@@ -1346,23 +1341,9 @@ async fn run_coordinator(
         }
     }
 
-    if let Some(e) = first_error {
-        // Share the original error with every output handoff so classification
-        // preserves FetchFailed/IO details regardless of stream completion order.
-        let shared = Arc::new(e);
-        for slot in senders.iter_mut() {
-            if let Some(sender) = slot.take() {
-                let err = DataFusionError::from(&shared);
-                let _ = sender.send(Err(err));
-            }
-        }
-        return;
-    }
-
-    for (slot, bucket) in senders.iter_mut().zip(grouped) {
-        if let Some(sender) = slot.take() {
-            let _ = sender.send(Ok(bucket));
-        }
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(summaries),
     }
 }
 
