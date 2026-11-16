@@ -163,7 +163,15 @@ impl ExecutionPlanVisitor for IndentVisitor<'_, '_> {
     ) -> std::result::Result<bool, Self::Error> {
         write!(self.f, "{:indent$}", "", indent = self.indent * 2)?;
         plan.fmt_as(self.t, self.f)?;
-        if let Some(metrics) = self.metrics.get(self.metric_index) {
+        // Like `collect_plan_metrics`, an operator without metrics takes no
+        // slot, so the operators after it keep their own.
+        let metrics = if plan.metrics().is_some() {
+            self.metric_index += 1;
+            self.metrics.get(self.metric_index - 1)
+        } else {
+            None
+        };
+        if let Some(metrics) = metrics {
             let metrics = metrics
                 .aggregate_by_name()
                 .sorted_for_display()
@@ -174,7 +182,6 @@ impl ExecutionPlanVisitor for IndentVisitor<'_, '_> {
         }
         writeln!(self.f)?;
         self.indent += 1;
-        self.metric_index += 1;
         Ok(true)
     }
 
@@ -190,5 +197,66 @@ impl ToStringifiedPlan for DisplayableBallistaExecutionPlan<'_> {
         plan_type: datafusion::logical_expr::PlanType,
     ) -> StringifiedPlan {
         StringifiedPlan::new(plan_type, self.indent().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+    use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::physical_plan::metrics::{Count, Metric, MetricValue};
+    use datafusion::physical_plan::union::UnionExec;
+    use std::sync::Arc;
+
+    fn output_rows(rows: usize) -> MetricsSet {
+        let count = Count::new();
+        count.add(rows);
+        let mut set = MetricsSet::new();
+        set.push(Arc::new(Metric::new(MetricValue::OutputRows(count), None)));
+        set
+    }
+
+    /// An operator without metrics, such as an `EmptyExec`, takes no slot in
+    /// the stage metrics, so the operators after it show their own.
+    #[test]
+    fn an_operator_without_metrics_does_not_shift_the_metrics_after_it() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let source =
+            MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)
+                .unwrap();
+        let union =
+            UnionExec::try_new(vec![Arc::new(EmptyExec::new(schema)), source]).unwrap();
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(union));
+        assert_eq!(collect_plan_metrics(plan.as_ref()).len(), 3);
+
+        let formatted = format_stage_metrics(
+            plan.as_ref(),
+            &[output_rows(30), output_rows(20), output_rows(10)],
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        assert!(
+            lines[0].starts_with("CoalescePartitionsExec")
+                && lines[0].contains("output_rows=30"),
+            "{formatted}"
+        );
+        assert!(
+            lines[1].trim_start().starts_with("UnionExec")
+                && lines[1].contains("output_rows=20"),
+            "{formatted}"
+        );
+        assert!(
+            lines[2].trim_start().starts_with("EmptyExec")
+                && lines[2].ends_with("metrics=[]"),
+            "{formatted}"
+        );
+        assert!(
+            lines[3].trim_start().starts_with("DataSourceExec")
+                && lines[3].contains("output_rows=10"),
+            "{formatted}"
+        );
     }
 }
