@@ -1645,8 +1645,6 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
         }
         let mut next_task = ready_id.and_then(|id| self.stages.get_mut(&id).map(|stage| (id, stage))).map(|(stage_id, stage)| {
             if let ExecutionStage::Running(stage) = stage {
-                use ballista_core::serde::scheduler::TaskKey;
-
                 // pop_next_task hands out a single-partition task — the
                 // bind path sized to `exec.vcores` lives in cluster/mod.rs.
                 let input_partition_ids = stage.pending.next_slice(1);
@@ -1655,48 +1653,15 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                         "Error getting next task for job {job_id}: Stage {stage_id} is ready but has no pending tasks"
                     )));
                 }
-                // task_id is the append slot in `task_infos` — assigned as
-                // `task_infos.len()` at bind time. `(job_id, stage_id, task_id)`
-                // is globally unique.
-                let task_id = stage.task_infos.len();
-                let task_attempt = input_partition_ids
-                    .iter()
-                    .map(|pid| stage.task_failure_numbers[*pid])
-                    .max()
-                    .unwrap_or(0);
-                let task_info = crate::state::execution_graph::TaskInfo {
-                    task_id,
-                    scheduled_time: timestamp_millis() as u128,
-                    // Those times will be updated when the task finish
-                    launch_time: 0,
-                    start_exec_time: 0,
-                    end_exec_time: 0,
-                    finish_time: 0,
-                    task_status: task_status::Status::Running(ballista_core::serde::protobuf::RunningTask {
-                        executor_id: executor_id.to_owned()
-                    }),
-                    global_input_partition_ids: input_partition_ids.clone(),
-                    vcores_consumed: input_partition_ids.len() as u32,
-                };
-                stage.task_infos.push(task_info);
-
-                let key = TaskKey {
-                    job_id,
-                    stage_id,
-                    task_id,
-                };
-
                 let vcores_consumed = input_partition_ids.len() as u32;
-                Ok(crate::state::execution_graph::TaskDescription {
-                    session_id,
-                    key,
-                    stage_attempt_num: stage.stage_attempt_num,
-                    task_attempt,
-                    global_input_partition_ids: input_partition_ids,
+                Ok(crate::state::execution_graph::append_task(
+                    stage,
+                    &session_id,
+                    &job_id,
+                    executor_id,
+                    input_partition_ids,
                     vcores_consumed,
-                    plan: stage.plan.clone(),
-                    session_config: self.session_config.clone()
-                })
+                ))
             } else {
                 Err(BallistaError::General(format!("Stage {stage_id} is not a running stage")))
             }
