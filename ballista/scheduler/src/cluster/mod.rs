@@ -23,9 +23,7 @@ use crate::scheduler_server::SessionBuilder;
 use crate::state::cache_registry::{
     BeginOutcome, CacheKey, CompleteOutcome, MaterializedCache,
 };
-use crate::state::execution_graph::{
-    ExecutionGraphBox, TaskDescription, create_task_info,
-};
+use crate::state::execution_graph::{ExecutionGraphBox, TaskDescription, append_task};
 use crate::state::session_manager::share_file_statistics_cache;
 use crate::state::task_builder::unsplittable_union_branch;
 use crate::state::task_manager::JobInfoCache;
@@ -40,7 +38,7 @@ use ballista_core::serde::protobuf::{
     AvailableVcores, ExecutorHeartbeat, JobStatus, job_status,
 };
 use ballista_core::serde::scheduler::PartitionLocation;
-use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata, TaskKey};
+use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata};
 use ballista_core::utils::{default_config_producer, default_session_builder};
 use ballista_core::{ConfigProducer, JobId, JobStatusSubscriber};
 use datafusion::arrow::datatypes::SchemaRef;
@@ -701,34 +699,14 @@ fn bind_one(
         is_unsplittable,
     );
     let executor_id = budget.executor_id.clone();
-    // task_id is the append-order slot in `task_infos` — since we're
-    // about to push, that's `task_infos.len()`. `(job_id, stage_id,
-    // task_id)` is globally unique.
-    let task_id = running_stage.task_infos.len();
-    let task_attempt = input_partition_ids
-        .iter()
-        .map(|pid| running_stage.task_failure_numbers[*pid])
-        .max()
-        .unwrap_or(0);
-    let mut task_info = create_task_info(executor_id.clone(), task_id);
-    task_info.global_input_partition_ids = input_partition_ids.clone();
-    task_info.vcores_consumed = vcores_consumed;
-    running_stage.task_infos.push(task_info);
-    let key = TaskKey {
-        job_id: job_id.clone(),
-        stage_id: running_stage.stage_id,
-        task_id,
-    };
-    let task_desc = TaskDescription {
-        session_id: session_id.to_string(),
-        key,
-        stage_attempt_num: running_stage.stage_attempt_num,
-        task_attempt,
-        global_input_partition_ids: input_partition_ids,
+    let task_desc = append_task(
+        running_stage,
+        session_id,
+        job_id,
+        &executor_id,
+        input_partition_ids,
         vcores_consumed,
-        plan: running_stage.plan.clone(),
-        session_config: running_stage.session_config.clone(),
-    };
+    );
     budget.vcores -= vcores_consumed;
     Some((executor_id, task_desc))
 }

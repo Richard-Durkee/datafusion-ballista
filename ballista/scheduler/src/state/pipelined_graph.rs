@@ -60,7 +60,7 @@ use ballista_core::serde::protobuf::{
 };
 use ballista_core::serde::scheduler::{
     ExecutorEndpoint, ExecutorMetadata, PartitionId, PartitionLocation,
-    PipelinedPartitionLocation, TaskKey,
+    PipelinedPartitionLocation,
 };
 use datafusion::physical_plan::{ExecutionPlan, replace_children_if_necessary};
 use datafusion::prelude::SessionConfig;
@@ -73,7 +73,7 @@ use crate::scheduler_server::event::QueryStageSchedulerEvent;
 use crate::scheduler_server::timestamp_millis;
 use crate::state::execution_graph::{
     ExecutionGraph, ExecutionGraphBox, ExecutionStage, ExecutionStageBuilder,
-    RunningTaskInfo, TaskDescription, create_task_info, waiting_external_inputs,
+    RunningTaskInfo, append_task, waiting_external_inputs,
 };
 use crate::state::execution_stage::{
     PendingPartitions, RunningStage, external_fetch_failures, external_reader_partitions,
@@ -501,7 +501,7 @@ impl PipelinedExecutionGraph {
             let mut running = RunningStage::new(
                 *stage_id,
                 0,
-                plan.clone(),
+                plan,
                 partitions,
                 output_links,
                 inputs,
@@ -510,34 +510,23 @@ impl PipelinedExecutionGraph {
             // Every partition is handed out here, so nothing is pending.
             running.pending = PendingPartitions::empty(partitions);
             for (task_id, (executor_id, slice)) in tasks.iter().enumerate() {
-                let mut task_info = create_task_info(executor_id.clone(), task_id);
-                task_info.global_input_partition_ids = slice.clone();
                 // The job's reservation covers every task and is released
                 // when the job ends, so no task carries vcores of its own.
-                task_info.vcores_consumed = 0;
-                running.task_infos.push(task_info);
-                bound.push((
-                    executor_id.clone(),
-                    TaskDescription {
-                        session_id: self.session_id.clone(),
-                        key: TaskKey {
-                            job_id: self.job_id.clone(),
-                            stage_id: *stage_id,
-                            task_id,
-                        },
-                        stage_attempt_num: 0,
-                        task_attempt: 0,
-                        global_input_partition_ids: slice.clone(),
-                        // The job's reservation on the executor, which sizes
-                        // the memory pool all its tasks there share.
-                        vcores_consumed: reserved
-                            .get(executor_id.as_str())
-                            .copied()
-                            .unwrap_or(1),
-                        plan: plan.clone(),
-                        session_config: self.session_config.clone(),
-                    },
-                ));
+                let mut task = append_task(
+                    &mut running,
+                    &self.session_id,
+                    &self.job_id,
+                    executor_id,
+                    slice.clone(),
+                    0,
+                );
+                // The job's reservation on the executor, which sizes the
+                // memory pool all its tasks there share.
+                // The locations above name each task by its index here.
+                debug_assert_eq!(task.key.task_id, task_id);
+                task.vcores_consumed =
+                    reserved.get(executor_id.as_str()).copied().unwrap_or(1);
+                bound.push((executor_id.clone(), task));
             }
             self.stages
                 .insert(*stage_id, ExecutionStage::Running(running));
@@ -1055,7 +1044,10 @@ impl ExecutionGraph for PipelinedExecutionGraph {
     }
 
     #[cfg(test)]
-    fn pop_next_task(&mut self, _executor_id: &str) -> Result<Option<TaskDescription>> {
+    fn pop_next_task(
+        &mut self,
+        _executor_id: &str,
+    ) -> Result<Option<crate::state::execution_graph::TaskDescription>> {
         Ok(None)
     }
 
@@ -1522,6 +1514,15 @@ mod tests {
                 task.key
             );
         }
+        // No task holds vcores of its own for a status report to refund.
+        let task_infos: Vec<_> = graph
+            .stages()
+            .values()
+            .filter_map(|stage| stage.task_infos())
+            .flatten()
+            .collect();
+        assert_eq!(task_infos.len(), bound.len());
+        assert!(task_infos.iter().all(|info| info.vcores_consumed == 0));
     }
 
     #[tokio::test]
