@@ -202,9 +202,21 @@ impl ExchangeExec {
         broadcast: bool,
         inactive_stage: bool,
     ) -> Self {
+        // A passthrough exchange whose stage has finished holds one list of
+        // shuffle files per partition the stage wrote, and its reader exposes
+        // exactly those. A replan can still rewrite the subtree below it (join
+        // selection swapping a join, say) into one with another partition
+        // count. Following the new input would let the parent drop its
+        // `CoalescePartitionsExec` and read only the first partitions.
+        let resolved_width = stage_partitions.lock().as_ref().map(Vec::len);
         let plan_partitioning = match (partitioning.as_ref(), broadcast) {
             (Some(partitioning), false) => partitioning.clone(),
-            (None, false) => input.output_partitioning().clone(),
+            (None, false) => match resolved_width {
+                Some(width) if input.output_partitioning().partition_count() != width => {
+                    Partitioning::UnknownPartitioning(width)
+                }
+                _ => input.output_partitioning().clone(),
+            },
             (_, true) => Partitioning::UnknownPartitioning(1),
         };
         // An exchange redistributes rows, so a constant that only holds within
@@ -648,7 +660,8 @@ mod range_repartition_routing_tests {
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::physical_plan::expressions::col;
     use datafusion::physical_plan::{
-        ChildrenPropertiesMode, ExecutionPlan, Partitioning, ReplaceChildrenOptions,
+        ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties, Partitioning,
+        ReplaceChildrenOptions,
     };
 
     /// Cuts as `Float64` scalars, which is what merging produces.
@@ -708,6 +721,39 @@ mod range_repartition_routing_tests {
         });
         let recovered = exchange.range_repartition_routing().unwrap();
         assert_eq!(recovered.cuts, cuts_f64([100.0]), "second resolve wins");
+    }
+
+    /// A finished passthrough exchange keeps the partition count its stage
+    /// wrote when a replan gives it an input with another count. The reader
+    /// built from it would otherwise expose only the first partitions.
+    #[test]
+    fn resolved_passthrough_exchange_keeps_its_width_when_the_input_changes() {
+        let wide: Arc<dyn ExecutionPlan> = Arc::new(
+            datafusion::physical_plan::repartition::RepartitionExec::try_new(
+                v_source(),
+                Partitioning::RoundRobinBatch(4),
+            )
+            .unwrap(),
+        );
+        let exchange = Arc::new(ExchangeExec::new(wide, None, 42));
+        assert_eq!(
+            exchange
+                .properties()
+                .output_partitioning()
+                .partition_count(),
+            4
+        );
+        exchange.resolve_shuffle_partitions(vec![vec![]; 4]);
+
+        let rebuilt = exchange
+            .clone()
+            .replace_children(
+                vec![v_source()],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap();
+        assert_eq!(v_source().output_partitioning().partition_count(), 1);
+        assert_eq!(rebuilt.output_partitioning().partition_count(), 4);
     }
 
     /// `with_new_children` must carry the routing slot through: transform
