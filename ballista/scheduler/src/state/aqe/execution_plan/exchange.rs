@@ -214,6 +214,14 @@ impl ExchangeExec {
         // same column. `RepartitionExec` clears them for the same reason.
         let mut eq_properties = input.properties().eq_properties.clone();
         eq_properties.clear_per_partition_constants();
+        // A repartitioning exchange reads each output partition from several
+        // map outputs in arrival order, so an ordering that holds within each
+        // input partition is lost. Keeping it lets the parent stay in sorted
+        // mode over unsorted rows: a sorted `AggregateExec` then emits a group
+        // once per run. `RepartitionExec` clears orderings for the same reason.
+        if partitioning.is_some() && input.output_partitioning().partition_count() > 1 {
+            eq_properties.clear_orderings();
+        }
         let properties = Arc::new(PlanProperties::new(
             eq_properties,
             plan_partitioning,
@@ -648,7 +656,8 @@ mod range_repartition_routing_tests {
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::physical_plan::expressions::col;
     use datafusion::physical_plan::{
-        ChildrenPropertiesMode, ExecutionPlan, Partitioning, ReplaceChildrenOptions,
+        ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties, Partitioning,
+        ReplaceChildrenOptions,
     };
 
     /// Cuts as `Float64` scalars, which is what merging produces.
@@ -708,6 +717,34 @@ mod range_repartition_routing_tests {
         });
         let recovered = exchange.range_repartition_routing().unwrap();
         assert_eq!(recovered.cuts, cuts_f64([100.0]), "second resolve wins");
+    }
+
+    /// A hash exchange over several sorted input partitions does not report
+    /// their ordering: its reader concatenates map outputs in arrival order.
+    #[test]
+    fn hash_exchange_over_sorted_partitions_reports_no_ordering() {
+        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new_default(
+            col("v", &schema).unwrap(),
+        )])
+        .unwrap();
+        let source = MemorySourceConfig::try_new(&[vec![], vec![]], schema.clone(), None)
+            .unwrap()
+            .try_with_sort_information(vec![ordering])
+            .unwrap();
+        let sorted: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(source);
+        assert_eq!(sorted.output_partitioning().partition_count(), 2);
+        assert!(sorted.output_ordering().is_some());
+
+        let hash = Partitioning::Hash(vec![col("v", &schema).unwrap()], 4);
+        let shuffled = ExchangeExec::new(Arc::clone(&sorted), Some(hash), 1);
+        assert!(shuffled.properties().output_ordering().is_none());
+
+        // A passthrough exchange is read back with an ordered merge.
+        let passthrough = ExchangeExec::new(sorted, None, 2);
+        assert!(passthrough.properties().output_ordering().is_some());
     }
 
     /// `with_new_children` must carry the routing slot through: transform

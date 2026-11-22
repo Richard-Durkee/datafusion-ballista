@@ -195,7 +195,9 @@ impl BallistaAdapter {
                 // ordering, preserve it across the shuffle boundary with a
                 // k-way merge instead of the arrival-order concat that the
                 // regular reader does.
-                if let Some(ordering) = exchange.input().output_ordering() {
+                if exchange.partitioning().is_none()
+                    && let Some(ordering) = exchange.input().output_ordering()
+                {
                     Arc::new(
                         RangeShuffleReaderExec::try_new(
                             stage_id,

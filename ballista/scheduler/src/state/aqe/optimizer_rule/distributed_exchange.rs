@@ -31,10 +31,12 @@ use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::joins::{HashJoinExec, NestedLoopJoinExec, PartitionMode};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::physical_plan::{
-    ChildrenPropertiesMode, ExecutionPlan, ReplaceChildrenOptions, execution_plan,
+    ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties,
+    ReplaceChildrenOptions, execution_plan,
 };
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -143,13 +145,26 @@ impl DistributedExchangeRule {
         {
             let input = repartition.input();
             if !matches!(nearest_exchange_status(input), ExchangeStatus::Unresolved) {
-                let exchange_exec = ExchangeExec::new(
+                let exchange_exec: Arc<dyn ExecutionPlan> = Arc::new(ExchangeExec::new(
                     input.clone(),
                     Some(repartition.partitioning().clone()),
                     self.plan_id_generator
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                );
-                return Ok(Transformed::yes(Arc::new(exchange_exec)));
+                ));
+                // An order-preserving repartition merges its inputs on the sort
+                // key. A shuffle reads them back in arrival order, so the
+                // ordering the parents were planned on is restored with a sort
+                // of each output partition.
+                if repartition.preserve_order()
+                    && input.output_partitioning().partition_count() > 1
+                    && let Some(ordering) = input.output_ordering()
+                {
+                    return Ok(Transformed::yes(Arc::new(
+                        SortExec::new(ordering.clone(), exchange_exec)
+                            .with_preserve_partitioning(true),
+                    )));
+                }
+                return Ok(Transformed::yes(exchange_exec));
             }
         } else if !execution_plan.is::<ExchangeExec>() {
             let children = execution_plan.children();
@@ -941,6 +956,52 @@ mod tests {
             matches!(exchange.partitioning, Some(Partitioning::Hash(_, 4))),
             "ExchangeExec should carry the hash partitioning"
         );
+    }
+
+    /// An order-preserving hash repartition over several sorted partitions
+    /// becomes an exchange with a sort of each output partition on top, since
+    /// the shuffle reader does not merge its inputs on the sort key.
+    #[test]
+    fn order_preserving_hash_repartition_is_sorted_after_the_exchange() {
+        use datafusion::arrow::datatypes::SchemaRef;
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::datasource::source::DataSourceExec;
+        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+        use datafusion::physical_plan::sorts::sort::SortExec;
+
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let col: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+            Arc::new(Column::new("a", 0));
+        let ordering =
+            LexOrdering::new(vec![PhysicalSortExpr::new_default(Arc::clone(&col))])
+                .unwrap();
+        let source = MemorySourceConfig::try_new(&[vec![], vec![]], schema, None)
+            .unwrap()
+            .try_with_sort_information(vec![ordering])
+            .unwrap();
+        let sorted: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(source);
+        let repartition = Arc::new(
+            RepartitionExec::try_new(sorted, Partitioning::Hash(vec![col], 4))
+                .unwrap()
+                .with_preserve_order(),
+        ) as Arc<dyn ExecutionPlan>;
+        assert!(repartition.output_ordering().is_some());
+
+        let rule = DistributedExchangeRule::default();
+        let result = rule.optimize(repartition, &config()).unwrap();
+
+        let adaptive = result.downcast_ref::<AdaptiveDatafusionExec>().unwrap();
+        let sort = adaptive
+            .input()
+            .downcast_ref::<SortExec>()
+            .expect("the exchange should be wrapped in a SortExec");
+        assert!(sort.preserve_partitioning());
+        let exchange = sort
+            .input()
+            .downcast_ref::<ExchangeExec>()
+            .expect("the SortExec should read from the exchange");
+        assert!(exchange.properties().output_ordering().is_none());
     }
 
     #[test]
