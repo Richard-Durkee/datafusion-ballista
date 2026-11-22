@@ -17,7 +17,6 @@
 
 use datafusion::common::DataFusionError;
 use datafusion::execution::{FunctionRegistry, SessionState};
-use datafusion::functions::all_default_functions;
 use datafusion::functions_aggregate::all_default_aggregate_functions;
 use datafusion::functions_nested::all_default_higher_order_functions;
 use datafusion::functions_window::all_default_window_functions;
@@ -42,10 +41,14 @@ pub struct BallistaFunctionRegistry {
 
 impl Default for BallistaFunctionRegistry {
     fn default() -> Self {
-        let scalar_functions: HashMap<String, Arc<ScalarUDF>> = all_default_functions()
-            .into_iter()
-            .map(|f| (f.name().to_string(), f))
-            .collect();
+        // The same list a Ballista session registers, which includes the
+        // nested functions (`array_length`, `array_element`, ...). A plan the
+        // scheduler accepted must decode on the executor.
+        let scalar_functions: HashMap<String, Arc<ScalarUDF>> =
+            crate::extension::ballista_scalar_functions()
+                .into_iter()
+                .map(|f| (f.name().to_string(), f))
+                .collect();
 
         let aggregate_functions: HashMap<String, Arc<AggregateUDF>> =
             all_default_aggregate_functions()
@@ -164,6 +167,17 @@ mod tests {
         // DataFusion's `abs` function should always be available
         assert!(registry.udf("abs").is_ok());
         assert!(registry.udfs().contains("abs"));
+    }
+
+    #[test]
+    fn test_nested_functions_available() {
+        let registry = BallistaFunctionRegistry::default();
+
+        // `array_length(col)` and `col[1]` reach the executor as scalar
+        // functions from datafusion-functions-nested.
+        for name in ["array_length", "array_element", "array_has", "make_array"] {
+            assert!(registry.udf(name).is_ok(), "{name} is missing");
+        }
     }
 
     #[test]
