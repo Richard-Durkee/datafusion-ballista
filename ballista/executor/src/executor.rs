@@ -257,6 +257,25 @@ impl Executor {
         }
     }
 
+    /// Returns the [`RuntimeProducer`] to decode the plan of a task of
+    /// `session_id` with.
+    ///
+    /// A plan keeps hold of state from the runtime it is decoded with: a
+    /// Parquet scan reads through that runtime's object store and footer
+    /// cache. So the plan has to be decoded with the session's runtime for the
+    /// task to share that state with the session's other tasks. The memory
+    /// pool is sized for one vcore, as nothing runs on this runtime.
+    pub fn runtime_producer_for_session(
+        self: &Arc<Self>,
+        session_id: &str,
+    ) -> RuntimeProducer {
+        let executor = Arc::clone(self);
+        let session_id = session_id.to_owned();
+        Arc::new(move |config: &SessionConfig| {
+            executor.produce_runtime_for_session(&session_id, config, 1)
+        })
+    }
+
     /// Produces the runtime for a task of the pipelined job `job_id`.
     ///
     /// A pipelined job's tasks on this executor run at the same time, on one
@@ -753,6 +772,29 @@ mod test {
 
         assert!(Arc::ptr_eq(&e1.cache_manager, &e2.cache_manager));
         assert!(!Arc::ptr_eq(&e1.cache_manager, &e3.cache_manager));
+    }
+
+    #[test]
+    fn runtime_producer_for_session_produces_the_session_runtime() {
+        let base_producer = fresh_runtime_producer();
+        let identity: MemoryPoolPolicy = Arc::new(|base, _, _| Ok(base));
+        let cache: Arc<dyn SessionRuntimeCache> = Arc::new(
+            DefaultSessionRuntimeCache::new(base_producer.clone(), identity, 4),
+        );
+        let executor = Arc::new(
+            test_executor("/tmp", base_producer, 2)
+                .with_session_runtime_cache(Some(cache)),
+        );
+
+        // A plan decoded for a task of `s1` has to hold the footer cache the
+        // session's other tasks use, not one built for the decode.
+        let cfg = SessionConfig::new();
+        let task = executor.produce_runtime_for_session("s1", &cfg, 1).unwrap();
+        let decode = executor.runtime_producer_for_session("s1")(&cfg).unwrap();
+        let other = executor.runtime_producer_for_session("s2")(&cfg).unwrap();
+
+        assert!(Arc::ptr_eq(&task.cache_manager, &decode.cache_manager));
+        assert!(!Arc::ptr_eq(&task.cache_manager, &other.cache_manager));
     }
 
     #[test]

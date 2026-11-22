@@ -793,12 +793,14 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorGrpc
         } = request.into_inner();
         let task_sender = self.executor_env.tx_task.clone();
         for task in tasks {
+            let runtime_producer =
+                self.executor.runtime_producer_for_session(&task.session_id);
             task_sender
                 .send(CuratorTaskDefinition {
                     scheduler_endpoint: scheduler_endpoint.clone(),
                     task: get_task_definition(
                         task,
-                        self.executor.runtime_producer.clone(),
+                        runtime_producer,
                         self.executor.produce_config(),
                         self.executor.function_registry.scalar_functions.clone(),
                         self.executor.function_registry.aggregate_functions.clone(),
@@ -831,9 +833,12 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorGrpc
         let mut failed_jobs: HashSet<String> = HashSet::new();
         for multi_task in multi_tasks {
             let job_id = multi_task.job_id.clone();
+            let runtime_producer = self
+                .executor
+                .runtime_producer_for_session(&multi_task.session_id);
             let multi_task: Vec<TaskDefinition> = match get_task_definition_vec(
                 multi_task,
-                self.executor.runtime_producer.clone(),
+                runtime_producer,
                 self.executor.produce_config(),
                 self.executor.function_registry.scalar_functions.clone(),
                 self.executor.function_registry.aggregate_functions.clone(),

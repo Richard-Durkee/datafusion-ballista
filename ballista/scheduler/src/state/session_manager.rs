@@ -47,15 +47,19 @@ impl SessionManager {
 
     /// Creates a new session or updates an existing one with the given configuration.
     ///
-    /// Returns the session context that can be used for query execution.
+    /// Returns the session context that can be used for query execution. Its
+    /// session ID is `session_id`, whichever ID the backend built it with, so
+    /// executors see one session across the queries of a client's session.
     pub async fn create_or_update_session(
         &self,
         session_id: &str,
         config: &SessionConfig,
     ) -> Result<Arc<SessionContext>> {
-        self.state
+        let ctx = self
+            .state
             .create_or_update_session(session_id, config)
-            .await
+            .await?;
+        Ok(with_session_id(ctx, session_id))
     }
 
     /// Creates a context for work the scheduler starts on behalf of a running
@@ -66,12 +70,31 @@ impl SessionManager {
         session_id: &str,
         config: &SessionConfig,
     ) -> Result<Arc<SessionContext>> {
-        self.state.new_context(session_id, config).await
+        let ctx = self.state.new_context(session_id, config).await?;
+        Ok(with_session_id(ctx, session_id))
     }
 
     pub(crate) fn produce_config(&self) -> SessionConfig {
         self.state.produce_config()
     }
+}
+
+/// Returns `ctx` under the session ID `session_id`.
+///
+/// A backend builds a context for every query, and a session builder gives
+/// each one an ID of its own. A job's tasks carry the ID of the context the
+/// job was planned with, and an executor keeps the state it shares between
+/// tasks, such as its Parquet footer cache, per session ID. So without this
+/// every query of a client's session would look like a new session to the
+/// executors, and none of that state would outlive a job.
+fn with_session_id(ctx: Arc<SessionContext>, session_id: &str) -> Arc<SessionContext> {
+    if ctx.session_id() == session_id {
+        return ctx;
+    }
+    let state = SessionStateBuilder::new_from_existing(ctx.state())
+        .with_session_id(session_id.to_string())
+        .build();
+    Arc::new(SessionContext::new_with_state(state))
 }
 
 /// Creates a DataFusion session context that is compatible with Ballista configuration.
@@ -168,6 +191,32 @@ pub fn share_file_statistics_cache(session_builder: SessionBuilder) -> SessionBu
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::cluster::memory::InMemoryJobState;
+    use ballista_core::utils::{default_config_producer, default_session_builder};
+
+    #[tokio::test]
+    async fn test_session_context_keeps_the_session_id_it_was_asked_for() -> Result<()> {
+        let manager = SessionManager::new(Arc::new(InMemoryJobState::new(
+            "",
+            Arc::new(default_session_builder),
+            Arc::new(default_config_producer),
+        )));
+        let config = SessionConfig::new();
+
+        // The session builder gives each context it builds an ID of its own.
+        let first = manager
+            .create_or_update_session("session_0", &config)
+            .await?;
+        let second = manager
+            .create_or_update_session("session_0", &config)
+            .await?;
+        assert_eq!("session_0", first.session_id());
+        assert_eq!("session_0", second.session_id());
+
+        let rebuild = manager.new_context("session_0", &config).await?;
+        assert_eq!("session_0", rebuild.session_id());
+        Ok(())
+    }
 
     #[test]
     fn test_share_file_statistics_cache_keeps_session_id() -> Result<()> {
