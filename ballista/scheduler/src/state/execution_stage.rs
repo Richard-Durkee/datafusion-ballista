@@ -1743,8 +1743,8 @@ mod tests {
     use ballista_core::JobId;
     use ballista_core::hll::DEFAULT_PRECISION;
     use ballista_core::serde::protobuf::{
-        ColumnSketch, OperatorMetric, SuccessfulTask, TaskColumnStats, TaskStatus,
-        operator_metric, task_status,
+        ColumnSketch, NamedCustom, OperatorMetric, SuccessfulTask, TaskColumnStats,
+        TaskStatus, operator_metric, task_status,
     };
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::prelude::SessionConfig;
@@ -2099,6 +2099,51 @@ mod tests {
 
         // Should gracefully reject the update, not panic.
         assert!(!result);
+    }
+
+    #[test]
+    fn test_update_task_metrics_sums_custom_metrics_across_tasks() {
+        let mut stage = make_running_stage(3);
+        append_running_task(&mut stage, 0, "executor-1", vec![0]);
+        append_running_task(&mut stage, 1, "executor-1", vec![1]);
+        append_running_task(&mut stage, 2, "executor-2", vec![2]);
+
+        // What an executor sends for an operator with its own metric type.
+        let task_metrics = |output_rows: u64, io_wait_ms: u64| {
+            let mut metrics = make_operator_metrics_set(output_rows, 10);
+            metrics.metrics.push(OperatorMetric {
+                metric: Some(operator_metric::Metric::Custom(NamedCustom {
+                    name: "io_wait".to_string(),
+                    display: format!("{io_wait_ms} ms"),
+                    value: io_wait_ms,
+                })),
+                partition: Some(0),
+            });
+            vec![metrics]
+        };
+
+        stage.update_task_metrics(0, task_metrics(100, 12)).unwrap();
+        stage.update_task_metrics(1, task_metrics(200, 30)).unwrap();
+        stage.update_task_metrics(2, task_metrics(300, 5)).unwrap();
+
+        let operator_metrics = &stage.stage_metrics.as_ref().unwrap()[0];
+        let io_wait = operator_metrics
+            .iter()
+            .filter(|metric| metric.value().name() == "io_wait")
+            .map(|metric| (metric.partition(), metric.value().to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            io_wait,
+            vec![
+                (Some(0), "12 ms".to_string()),
+                (Some(1), "30 ms".to_string()),
+                (Some(2), "5 ms".to_string()),
+            ]
+        );
+
+        let aggregated = operator_metrics.aggregate_by_name();
+        assert_eq!(aggregated.output_rows(), Some(600));
+        assert_eq!(aggregated.sum_by_name("io_wait").unwrap().as_usize(), 47);
     }
 
     #[test]

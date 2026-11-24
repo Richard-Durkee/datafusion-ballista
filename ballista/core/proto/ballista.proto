@@ -822,6 +822,16 @@ message NamedRatio {
   uint64 total = 3;
 }
 
+// A `MetricValue::Custom`. The executor's metric type is not known to the
+// scheduler, so only its rendered form and numeric value are carried.
+message NamedCustom {
+  string name = 1;
+  // The value's `Display` output.
+  string display = 2;
+  // The value's `as_usize()`.
+  uint64 value = 3;
+}
+
 message OperatorMetric {
   oneof metric {
     uint64 output_rows = 1;
@@ -839,6 +849,7 @@ message OperatorMetric {
     NamedPruningMetrics pruning_metrics = 13;
     NamedRatio ratio = 14;
     uint64 output_batches = 15;
+    NamedCustom custom = 17;
   }
   // Local partition index within the reporting task's plan (0..slice_len-1).
   // The scheduler maps this to a global partition id via the task's

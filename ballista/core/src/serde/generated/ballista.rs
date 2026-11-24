@@ -1176,6 +1176,20 @@ pub struct NamedRatio {
     #[prost(uint64, tag = "3")]
     pub total: u64,
 }
+/// A `MetricValue::Custom`. The executor's metric type is not known to the
+/// scheduler, so only its rendered form and numeric value are carried.
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NamedCustom {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// The value's `Display` output.
+    #[prost(string, tag = "2")]
+    pub display: ::prost::alloc::string::String,
+    /// The value's `as_usize()`.
+    #[prost(uint64, tag = "3")]
+    pub value: u64,
+}
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OperatorMetric {
@@ -1186,7 +1200,7 @@ pub struct OperatorMetric {
     pub partition: ::core::option::Option<u32>,
     #[prost(
         oneof = "operator_metric::Metric",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17"
     )]
     pub metric: ::core::option::Option<operator_metric::Metric>,
 }
@@ -1225,6 +1239,8 @@ pub mod operator_metric {
         Ratio(super::NamedRatio),
         #[prost(uint64, tag = "15")]
         OutputBatches(u64),
+        #[prost(message, tag = "17")]
+        Custom(super::NamedCustom),
     }
 }
 /// Where a reader fetches a partition from: only what a fetch needs, since a

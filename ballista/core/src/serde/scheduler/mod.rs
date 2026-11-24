@@ -32,6 +32,8 @@ use std::fmt::Debug;
 use std::path::PathBuf;
 use std::{collections::HashMap, fmt, sync::Arc};
 
+/// A custom metric value as reconstructed on the scheduler.
+pub mod custom_metric;
 /// Conversions from protobuf types to Ballista types.
 pub mod from_proto;
 /// Conversions from Ballista types to protobuf types.

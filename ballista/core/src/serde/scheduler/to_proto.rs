@@ -32,7 +32,9 @@ use crate::serde::scheduler::{
     PipelinedPartitionLocation,
 };
 use datafusion::physical_plan::Partitioning;
-use protobuf::{NamedCount, NamedGauge, NamedTime, action::ActionType, operator_metric};
+use protobuf::{
+    NamedCount, NamedCustom, NamedGauge, NamedTime, action::ActionType, operator_metric,
+};
 
 impl TryInto<protobuf::Action> for Action {
     type Error = BallistaError;
@@ -344,11 +346,13 @@ impl TryInto<operator_metric::Metric> for &MetricValue {
             MetricValue::OutputBatches(count) => {
                 Ok(operator_metric::Metric::OutputBatches(count.value() as u64))
             }
-            // at the moment there there is no way to serialize custom metrics
-            // thus at the moment we can't support it
-            MetricValue::Custom { .. } => Err(BallistaError::General(String::from(
-                "Custom metrics values are not supported",
-            ))),
+            MetricValue::Custom { name, value } => {
+                Ok(operator_metric::Metric::Custom(NamedCustom {
+                    name: name.to_string(),
+                    display: value.to_string(),
+                    value: value.as_usize() as u64,
+                }))
+            }
         }
     }
 }
