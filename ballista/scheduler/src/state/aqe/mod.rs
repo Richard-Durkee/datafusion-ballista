@@ -27,7 +27,7 @@ use crate::state::execution_graph::{
     StageOutput,
 };
 use crate::state::execution_stage::{
-    RunningStage, external_fetch_failures, external_inputs,
+    RunningStage, external_fetch_failures, external_inputs, write_not_retried,
 };
 use crate::state::task_manager::UpdatedStages;
 use ballista_core::JobId;
@@ -1069,6 +1069,22 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                         //
                         if let Some(task_status::Status::Failed(failed_task)) = status {
                             let failed_reason = failed_task.failed_reason;
+
+                            // A write task is never run again. An execution
+                            // error fails the stage below anyway, with its own
+                            // message.
+                            if running_stage.writes_output()
+                                && !matches!(
+                                    failed_reason,
+                                    Some(FailedReason::ExecutionError(_)) | None
+                                )
+                            {
+                                failed_stages.insert(
+                                    stage_id,
+                                    write_not_retried(stage_id, &failed_task.error),
+                                );
+                                continue;
+                            }
 
                             match failed_reason {
                                 Some(FailedReason::FetchPartitionError(

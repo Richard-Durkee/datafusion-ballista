@@ -19,6 +19,7 @@ use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{ColumnStatistics, DataFusionError};
 use datafusion::config::ConfigOptions;
+use datafusion::datasource::sink::DataSinkExec;
 use datafusion::physical_optimizer::aggregate_statistics::AggregateStatistics;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryInto;
@@ -686,6 +687,28 @@ impl MergedSketch {
 }
 
 impl RunningStage {
+    /// Whether this stage writes output (its plan holds a `DataSinkExec`).
+    ///
+    /// Ballista never runs a task of such a stage twice. A task that failed,
+    /// or ran on an executor that was lost, may already have written some or
+    /// all of its files, and the scheduler cannot tell. Running it again could
+    /// write the data twice.
+    pub fn writes_output(&self) -> bool {
+        plan_writes_output(&self.plan)
+    }
+
+    /// Whether a task of this stage has started on `executor_id`, or on any
+    /// executor if `None`.
+    pub fn started_task_on(&self, executor_id: Option<&str>) -> bool {
+        self.task_infos.iter().any(|task| match &task.task_status {
+            task_status::Status::Running(RunningTask { executor_id: e })
+            | task_status::Status::Successful(SuccessfulTask {
+                executor_id: e, ..
+            }) => executor_id.is_none_or(|id| id == e),
+            _ => false,
+        })
+    }
+
     /// Creates a new running stage with task tracking initialized.
     pub fn new(
         stage_id: usize,
@@ -1535,6 +1558,22 @@ pub(crate) fn external_inputs(plan: &dyn ExecutionPlan) -> HashMap<usize, StageO
 }
 
 /// Whether `inputs` hold external (cache) data on `executor_id`.
+/// Whether `plan` writes output: it holds a [`DataSinkExec`], as `COPY` and
+/// `INSERT INTO` plans do.
+pub(crate) fn plan_writes_output(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.downcast_ref::<DataSinkExec>().is_some()
+        || plan.children().into_iter().any(plan_writes_output)
+}
+
+/// The reason a write stage fails instead of running a task again.
+pub(crate) fn write_not_retried(stage_id: usize, cause: &str) -> String {
+    format!(
+        "Stage {stage_id} writes output, so its task is not run again: the \
+         failed attempt may already have written some or all of its files, and \
+         a second run could write the data twice. Cause: {cause}"
+    )
+}
+
 pub(crate) fn reads_external_data_on(
     inputs: &HashMap<usize, StageOutput>,
     executor_id: &str,

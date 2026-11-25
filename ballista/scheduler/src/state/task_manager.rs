@@ -1020,6 +1020,13 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 )
             } else if let Some(Some(reason)) = lost_pipelined {
                 reason
+            } else if let Some(stage_id) = graph.write_lost_on(executor_id) {
+                format!(
+                    "Job {job_id} lost executor {executor_id} while stage {stage_id} \
+                     was writing output. The write is not run again: the lost task \
+                     may already have written some or all of its files, and a \
+                     second run could write the data twice"
+                )
             } else {
                 // The reset drops the executor's cache locations like any
                 // other, and rolls back the stages reading them. A pipelined
@@ -1434,8 +1441,8 @@ mod tests {
     use crate::test_utils::{
         drain_tasks_with_executor, fail_plan_rewrites, join_aggregate_sort_logical_plan,
         mock_completed_task, mock_executor,
-        revive_graph_and_complete_next_stage_with_executor, test_aggregation_plan,
-        test_aggregation_plan_with_job_id,
+        revive_graph_and_complete_next_stage_with_executor, run_until_write_stage,
+        test_aggregation_plan, test_aggregation_plan_with_job_id, test_copy_plan,
     };
     use ballista_core::serde::protobuf::job_status::Status;
     use ballista_core::serde::protobuf::task_status;
@@ -1836,6 +1843,56 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[tokio::test]
+    async fn executor_lost_fails_job_whose_write_task_ran_on_it() -> Result<()> {
+        let (manager, _, _, _) = setup_job(false).await?;
+        let dead = mock_executor("executor-dead".to_string());
+
+        let mut graph = test_copy_plan(2).await;
+        run_until_write_stage(&mut graph, &dead)?;
+        graph
+            .pop_next_task(&dead.id)?
+            .expect("the write stage should have a task to assign");
+        let job_id = graph.job_id().clone();
+        manager
+            .active_job_cache
+            .insert(job_id.clone(), JobInfoCache::new(Box::new(graph)));
+
+        let outcome = manager.executor_lost(&dead.id).await?;
+
+        let (_, reason, _) = outcome
+            .failed_jobs
+            .iter()
+            .find(|(failed_id, _, _)| *failed_id == job_id)
+            .expect("a write task on the lost executor should fail the job");
+        assert!(reason.contains("was writing output"), "{reason}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executor_lost_reruns_write_stage_that_has_not_started() -> Result<()> {
+        let (manager, _, _, _) = setup_job(false).await?;
+        let dead = mock_executor("executor-dead".to_string());
+
+        // The dead executor holds the write stage's input, but no write task
+        // has started, so nothing can have been written: the job recovers.
+        let mut graph = test_copy_plan(2).await;
+        run_until_write_stage(&mut graph, &dead)?;
+        let job_id = graph.job_id().clone();
+        manager
+            .active_job_cache
+            .insert(job_id.clone(), JobInfoCache::new(Box::new(graph)));
+
+        let outcome = manager.executor_lost(&dead.id).await?;
+
+        assert!(
+            outcome.failed_jobs.iter().all(|(id, _, _)| *id != job_id),
+            "{:?}",
+            outcome.failed_jobs
+        );
+        Ok(())
     }
 
     #[tokio::test]

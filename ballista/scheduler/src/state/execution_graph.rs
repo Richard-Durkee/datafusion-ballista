@@ -59,7 +59,7 @@ pub(crate) use crate::state::execution_stage::{
 };
 use crate::state::execution_stage::{
     RunningStage, external_fetch_failures, external_inputs, external_reader_partitions,
-    fold_external_locations, reads_external_data_on,
+    fold_external_locations, reads_external_data_on, write_not_retried,
 };
 use crate::state::pipelined_graph::PipelinedExecutionGraph;
 use crate::state::task_manager::UpdatedStages;
@@ -235,6 +235,35 @@ pub trait ExecutionGraph: Debug {
             }
             _ => false,
         })
+    }
+
+    /// The stage writing output that losing `executor_id` would run a task of
+    /// again, if any. Such a stage fails instead: see
+    /// [`RunningStage::writes_output`].
+    ///
+    /// That is the case if one of its tasks ran on the executor, or if the
+    /// executor holds the stage's input while its tasks have started, since
+    /// the stage is then rolled back and every task runs again.
+    fn write_lost_on(&self, executor_id: &str) -> Option<usize> {
+        self.stages()
+            .iter()
+            .find_map(|(stage_id, stage)| match stage {
+                ExecutionStage::Running(stage)
+                    if stage.writes_output()
+                        && (stage.started_task_on(Some(executor_id))
+                            || (stage.started_task_on(None)
+                                && stage.inputs.values().any(|input| {
+                                    input
+                                        .partition_locations
+                                        .values()
+                                        .flatten()
+                                        .any(|loc| loc.executor_meta.id == executor_id)
+                                }))) =>
+                {
+                    Some(*stage_id)
+                }
+                _ => None,
+            })
     }
 
     /// The external (cache) inputs stages wait for: lost, and not provided
@@ -988,6 +1017,23 @@ impl ExecutionGraph for StaticExecutionGraph {
 
                         if let Some(task_status::Status::Failed(failed_task)) = status {
                             let failed_reason = failed_task.failed_reason;
+
+                            // A write task is never run again. An execution
+                            // error fails the stage below anyway, with its own
+                            // message.
+                            if running_stage.writes_output()
+                                && !matches!(
+                                    failed_reason,
+                                    Some(FailedReason::ExecutionError(_)) | None
+                                )
+                            {
+                                record_stage_failure(
+                                    &mut failed_stages,
+                                    stage_id,
+                                    write_not_retried(stage_id, &failed_task.error),
+                                );
+                                continue;
+                            }
 
                             match failed_reason {
                                 Some(FailedReason::FetchPartitionError(
@@ -2188,9 +2234,9 @@ mod test {
         aggregation_logical_plan, drain_tasks, execution_failure, fail_plan_rewrites,
         fetch_partition_failure, graph_from_physical, mock_completed_task, mock_executor,
         mock_failed_task, revive_graph_and_complete_next_stage,
-        revive_graph_and_complete_next_stage_with_executor, test_aggregation_plan,
-        test_coalesce_plan, test_join_plan, test_two_aggregations_plan,
-        test_union_all_plan, test_union_plan,
+        revive_graph_and_complete_next_stage_with_executor, run_until_write_stage,
+        test_aggregation_plan, test_coalesce_plan, test_copy_plan, test_join_plan,
+        test_two_aggregations_plan, test_union_all_plan, test_union_plan,
     };
     use ballista_core::JobId;
     use ballista_core::execution_plans::ShuffleReaderExec;
@@ -2686,6 +2732,42 @@ mod test {
             !agg_graph.is_successful(),
             "Expected the agg graph can not complete"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_task_is_not_retried_after_io_error() -> Result<()> {
+        let executor = mock_executor("executor-id1".to_string());
+        let mut graph = test_copy_plan(2).await;
+        run_until_write_stage(&mut graph, &executor)?;
+
+        let task = graph.pop_next_task(&executor.id)?.unwrap();
+        let status = mock_failed_task(
+            task,
+            FailedTask {
+                error: "IOError".to_string(),
+                retryable: true,
+                count_to_failures: true,
+                failed_reason: Some(failed_task::FailedReason::IoError(IoError {})),
+            },
+        );
+        graph.update_task_status(&executor, vec![status], 4, 4)?;
+
+        // The job fails at once instead of running the write again.
+        assert_eq!(graph.available_tasks(), 0);
+        assert!(
+            matches!(
+                graph.status(),
+                JobStatus {
+                    status: Some(job_status::Status::Failed(_)),
+                    ..
+                }
+            ),
+            "Expected job status to be Failed"
+        );
+        let reason = format!("{:?}", graph.status);
+        assert!(reason.contains("writes output, so its task is not run again"));
+        assert!(reason.contains("IOError"));
         Ok(())
     }
 

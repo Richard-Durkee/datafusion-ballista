@@ -1313,6 +1313,49 @@ pub async fn test_aggregation_plan_with_config(
     .await
 }
 
+/// Creates a test execution graph that writes the result of the aggregation
+/// in [`test_aggregation_plan`] with `COPY ... TO`, so its final stage holds a
+/// `DataSinkExec`. Nothing is written unless the graph's tasks are executed.
+pub async fn test_copy_plan(partition: usize) -> StaticExecutionGraph {
+    use datafusion::datasource::file_format::format_as_file_type;
+    use datafusion::datasource::file_format::parquet::ParquetFormatFactory;
+    use datafusion::logical_expr::LogicalPlanBuilder;
+
+    let plan = LogicalPlanBuilder::copy_to(
+        aggregation_logical_plan(2),
+        "file:///tmp/ballista-test-copy/".to_string(),
+        format_as_file_type(Arc::new(ParquetFormatFactory::new())),
+        Default::default(),
+        vec![],
+    )
+    .unwrap()
+    .build()
+    .unwrap();
+    graph_from_logical(
+        &test_session(partition),
+        &plan,
+        &"job".into(),
+        Arc::new(SessionConfig::new_with_ballista()),
+    )
+    .await
+}
+
+/// Completes stages of `graph` on `executor` until its running stage is the
+/// one writing output.
+pub fn run_until_write_stage(
+    graph: &mut dyn ExecutionGraph,
+    executor: &ExecutorMetadata,
+) -> Result<()> {
+    graph.revive();
+    while !graph.stages().values().any(
+        |stage| matches!(stage, ExecutionStage::Running(stage) if stage.writes_output()),
+    ) {
+        revive_graph_and_complete_next_stage_with_executor(graph, executor)?;
+        graph.revive();
+    }
+    Ok(())
+}
+
 /// Creates a test execution graph with two nested aggregations.
 pub async fn test_two_aggregations_plan(partition: usize) -> StaticExecutionGraph {
     let schema = Schema::new(vec![
