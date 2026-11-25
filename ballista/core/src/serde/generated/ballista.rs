@@ -1189,6 +1189,12 @@ pub struct NamedCustom {
     /// The value's `as_usize()`.
     #[prost(uint64, tag = "3")]
     pub value: u64,
+    /// Set by a `CustomMetricCodec` on the executor: names the metric type, so
+    /// the codec on the scheduler can rebuild it from `encoded`.
+    #[prost(string, tag = "4")]
+    pub type_tag: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "5")]
+    pub encoded: ::prost::alloc::vec::Vec<u8>,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

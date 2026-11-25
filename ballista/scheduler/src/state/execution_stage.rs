@@ -21,14 +21,13 @@ use datafusion::common::{ColumnStatistics, DataFusionError};
 use datafusion::config::ConfigOptions;
 use datafusion::physical_optimizer::aggregate_statistics::AggregateStatistics;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::convert::TryInto;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 //use datafusion::physical_optimizer::join_selection::JoinSelection;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
-use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
+use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, Metric};
 use datafusion::prelude::SessionConfig;
 use log::{debug, warn};
@@ -41,6 +40,7 @@ use ballista_core::execution_plans::{
     ShuffleWriterExec, SortShuffleWriterExec, TaskRuntimeStats, TaskWindowState,
     UnresolvedShuffleExec,
 };
+use ballista_core::extension::SessionConfigExt as _;
 use ballista_core::hll::HyperLogLog;
 use ballista_core::serde::protobuf::failed_task::FailedReason;
 use ballista_core::serde::protobuf::{
@@ -49,6 +49,8 @@ use ballista_core::serde::protobuf::{
 };
 use ballista_core::serde::protobuf::{RunningTask, task_status};
 use ballista_core::serde::scheduler::PartitionLocation;
+use ballista_core::serde::scheduler::custom_metric::CustomMetricCodec;
+use ballista_core::serde::scheduler::from_proto::metric_from_proto;
 use ballista_core::utils::collect_plan_metrics;
 
 use crate::display::DisplayableBallistaExecutionPlan;
@@ -1059,11 +1061,18 @@ impl RunningStage {
 
         let global_partitions =
             self.task_infos[task_id].global_input_partition_ids.clone();
+        let codec = self.session_config.ballista_custom_metric_codec();
 
         let new_metrics_set = if let Some(combined_metrics) = &mut self.stage_metrics {
             let metrics_values_array = metrics
                 .into_iter()
-                .map(|ms| Self::metrics_set_from_task_metrics(ms, &global_partitions))
+                .map(|ms| {
+                    Self::metrics_set_from_task_metrics(
+                        ms,
+                        &global_partitions,
+                        codec.as_deref(),
+                    )
+                })
                 .collect::<Result<Vec<_>>>()?;
 
             combined_metrics
@@ -1080,7 +1089,13 @@ impl RunningStage {
         } else {
             metrics
                 .into_iter()
-                .map(|ms| Self::metrics_set_from_task_metrics(ms, &global_partitions))
+                .map(|ms| {
+                    Self::metrics_set_from_task_metrics(
+                        ms,
+                        &global_partitions,
+                        codec.as_deref(),
+                    )
+                })
                 .collect::<Result<Vec<_>>>()?
         };
         self.stage_metrics = Some(new_metrics_set);
@@ -1160,6 +1175,7 @@ impl RunningStage {
     fn metrics_set_from_task_metrics(
         metrics: OperatorMetricsSet,
         global_partitions: &[usize],
+        codec: Option<&dyn CustomMetricCodec>,
     ) -> Result<MetricsSet> {
         let mut metrics_set = MetricsSet::new();
         for proto_metric in metrics.metrics {
@@ -1169,7 +1185,7 @@ impl RunningStage {
                     "OperatorMetric.metric is None while folding task metrics".into(),
                 )
             })?;
-            let metric_value: MetricValue = inner.try_into()?;
+            let metric_value = metric_from_proto(inner, codec)?;
             let tags: Vec<Option<usize>> = match local_partition {
                 Some(local) if local < global_partitions.len() => {
                     vec![Some(global_partitions[local])]
@@ -1747,6 +1763,7 @@ mod tests {
         TaskStatus, operator_metric, task_status,
     };
     use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::physical_plan::metrics::MetricValue;
     use datafusion::prelude::SessionConfig;
     use std::collections::HashMap;
 
@@ -2116,6 +2133,7 @@ mod tests {
                     name: "io_wait".to_string(),
                     display: format!("{io_wait_ms} ms"),
                     value: io_wait_ms,
+                    ..Default::default()
                 })),
                 partition: Some(0),
             });
@@ -2144,6 +2162,113 @@ mod tests {
         let aggregated = operator_metrics.aggregate_by_name();
         assert_eq!(aggregated.output_rows(), Some(600));
         assert_eq!(aggregated.sum_by_name("io_wait").unwrap().as_usize(), 47);
+    }
+
+    /// A custom metric that keeps the largest value, with a codec for it.
+    #[derive(Debug)]
+    struct MaxMillis(std::sync::atomic::AtomicUsize);
+
+    impl std::fmt::Display for MaxMillis {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "max {} ms",
+                self.0.load(std::sync::atomic::Ordering::Relaxed)
+            )
+        }
+    }
+
+    impl datafusion::physical_plan::metrics::CustomMetricValue for MaxMillis {
+        fn new_empty(
+            &self,
+        ) -> Arc<dyn datafusion::physical_plan::metrics::CustomMetricValue> {
+            Arc::new(Self(Default::default()))
+        }
+
+        fn aggregate(
+            &self,
+            other: Arc<dyn datafusion::physical_plan::metrics::CustomMetricValue>,
+        ) {
+            self.0
+                .fetch_max(other.as_usize(), std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_usize(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn is_eq(
+            &self,
+            other: &Arc<dyn datafusion::physical_plan::metrics::CustomMetricValue>,
+        ) -> bool {
+            other.as_usize() == self.as_usize()
+        }
+    }
+
+    #[derive(Debug)]
+    struct MaxMillisCodec;
+
+    impl CustomMetricCodec for MaxMillisCodec {
+        fn try_encode(
+            &self,
+            value: &dyn datafusion::physical_plan::metrics::CustomMetricValue,
+        ) -> Option<(String, Vec<u8>)> {
+            value.as_any().downcast_ref::<MaxMillis>()?;
+            Some((
+                "max_ms".to_string(),
+                value.as_usize().to_string().into_bytes(),
+            ))
+        }
+
+        fn try_decode(
+            &self,
+            _type_tag: &str,
+            encoded: &[u8],
+        ) -> datafusion::error::Result<
+            Arc<dyn datafusion::physical_plan::metrics::CustomMetricValue>,
+        > {
+            let value = std::str::from_utf8(encoded).unwrap().parse().unwrap();
+            Ok(Arc::new(MaxMillis(std::sync::atomic::AtomicUsize::new(
+                value,
+            ))))
+        }
+    }
+
+    #[test]
+    fn test_update_task_metrics_decodes_custom_metrics_with_the_codec() {
+        let mut stage = make_running_stage(2);
+        stage.session_config = Arc::new(
+            SessionConfig::default()
+                .with_ballista_custom_metric_codec(Arc::new(MaxMillisCodec)),
+        );
+        append_running_task(&mut stage, 0, "executor-1", vec![0]);
+        append_running_task(&mut stage, 1, "executor-2", vec![1]);
+
+        for (task_id, wait_ms) in [(0, 30), (1, 12)] {
+            let mut metrics = make_operator_metrics_set(100, 10);
+            metrics.metrics.push(OperatorMetric {
+                metric: Some(operator_metric::Metric::Custom(NamedCustom {
+                    name: "wait".to_string(),
+                    display: format!("max {wait_ms} ms"),
+                    value: wait_ms,
+                    type_tag: "max_ms".to_string(),
+                    encoded: wait_ms.to_string().into_bytes(),
+                })),
+                partition: Some(0),
+            });
+            stage.update_task_metrics(task_id, vec![metrics]).unwrap();
+        }
+
+        let aggregated = stage.stage_metrics.as_ref().unwrap()[0].aggregate_by_name();
+        let wait = aggregated
+            .iter()
+            .find(|metric| metric.value().name() == "wait")
+            .unwrap();
+        assert_eq!(wait.value().to_string(), "max 30 ms");
     }
 
     #[test]

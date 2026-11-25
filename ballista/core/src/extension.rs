@@ -33,6 +33,7 @@ use crate::config::{
 use crate::execution_plans::plan_algebra::PartitionSliceableResolver;
 use crate::planner::BallistaQueryPlanner;
 use crate::serde::protobuf::KeyValuePair;
+use crate::serde::scheduler::custom_metric::CustomMetricCodec;
 use crate::serde::{BallistaLogicalExtensionCodec, BallistaPhysicalExtensionCodec};
 use crate::utils::redact_config_value;
 use datafusion::common::DFSchemaRef;
@@ -148,6 +149,16 @@ pub trait SessionConfigExt {
     fn ballista_partition_sliceable_resolver(
         &self,
     ) -> Option<Arc<dyn PartitionSliceableResolver>>;
+
+    /// Sets the codec that sends custom metric values from executors to the
+    /// scheduler as their own type. Set the same codec on both.
+    fn with_ballista_custom_metric_codec(
+        self,
+        codec: Arc<dyn CustomMetricCodec>,
+    ) -> SessionConfig;
+
+    /// Returns the [CustomMetricCodec] if set.
+    fn ballista_custom_metric_codec(&self) -> Option<Arc<dyn CustomMetricCodec>>;
 
     /// Overrides ballista's [QueryPlanner]
     fn with_ballista_query_planner(
@@ -565,6 +576,18 @@ impl SessionConfigExt for SessionConfig {
         self.with_extension(Arc::new(extension))
     }
 
+    fn with_ballista_custom_metric_codec(
+        self,
+        codec: Arc<dyn CustomMetricCodec>,
+    ) -> SessionConfig {
+        self.with_extension(Arc::new(BallistaConfigExtensionCustomMetricCodec(codec)))
+    }
+
+    fn ballista_custom_metric_codec(&self) -> Option<Arc<dyn CustomMetricCodec>> {
+        self.get_extension::<BallistaConfigExtensionCustomMetricCodec>()
+            .map(|extension| Arc::clone(&extension.0))
+    }
+
     fn ballista_logical_extension_codec(&self) -> Arc<dyn LogicalExtensionCodec> {
         self.get_extension::<BallistaConfigExtensionLogicalCodec>()
             .map(|c| c.codec())
@@ -900,6 +923,9 @@ impl BallistaConfigExtensionLogicalCodec {
         self.codec.clone()
     }
 }
+
+/// Wrapper for [SessionConfig] extension holding the [CustomMetricCodec]
+struct BallistaConfigExtensionCustomMetricCodec(Arc<dyn CustomMetricCodec>);
 
 /// Wrapper for [SessionConfig] extension
 /// holding [PhysicalExtensionCodec] if overridden

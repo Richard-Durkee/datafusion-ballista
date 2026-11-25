@@ -35,12 +35,15 @@ use std::time::Duration;
 use crate::error::BallistaError;
 use crate::extension::SessionConfigHelperExt;
 use crate::serde::protobuf::{NamedCustom, NamedPruningMetrics, NamedRatio};
-use crate::serde::scheduler::custom_metric::SerializedCustomMetricValue;
+use crate::serde::scheduler::custom_metric::{
+    CustomMetricCodec, SerializedCustomMetricValue,
+};
 use crate::serde::scheduler::{
     Action, BallistaFunctionRegistry, ByteRange, ExecutorData, ExecutorEndpoint,
     ExecutorOperatingSystemSpecification, ExecutorSpecification, PartitionId,
     PartitionLocation, PartitionStats, PipelinedPartitionLocation, TaskDefinition,
 };
+use log::debug;
 
 use crate::serde::{BallistaCodec, protobuf};
 use crate::{JobId, RuntimeProducer};
@@ -371,6 +374,7 @@ impl TryInto<MetricValue> for operator_metric::Metric {
                 name,
                 display,
                 value,
+                ..
             }) => Ok(MetricValue::Custom {
                 name: name.into(),
                 value: Arc::new(SerializedCustomMetricValue::new(
@@ -382,22 +386,58 @@ impl TryInto<MetricValue> for operator_metric::Metric {
     }
 }
 
+/// Decodes `metric`, using `codec` to rebuild the custom metric types it
+/// encoded. A custom value the codec can't rebuild falls back to its snapshot.
+pub fn metric_from_proto(
+    metric: operator_metric::Metric,
+    codec: Option<&dyn CustomMetricCodec>,
+) -> Result<MetricValue, BallistaError> {
+    if let (operator_metric::Metric::Custom(custom), Some(codec)) = (&metric, codec)
+        && !custom.type_tag.is_empty()
+    {
+        match codec.try_decode(&custom.type_tag, &custom.encoded) {
+            Ok(value) => {
+                return Ok(MetricValue::Custom {
+                    name: custom.name.clone().into(),
+                    value,
+                });
+            }
+            Err(e) => debug!(
+                "Could not decode custom metric {} of type {}, using its snapshot: {e}",
+                custom.name, custom.type_tag
+            ),
+        }
+    }
+    metric.try_into()
+}
+
+/// Decodes `metrics`, using `codec` to rebuild the custom metric types it
+/// encoded.
+pub fn metrics_set_from_proto(
+    metrics: protobuf::OperatorMetricsSet,
+    codec: Option<&dyn CustomMetricCodec>,
+) -> Result<MetricsSet, BallistaError> {
+    let mut ms = MetricsSet::new();
+    for proto_metric in metrics.metrics {
+        let partition = proto_metric.partition.map(|p| p as usize);
+        let inner = proto_metric.metric.ok_or_else(|| {
+            BallistaError::General(
+                "scheduler::from_proto(OperatorMetric) metric is None.".to_owned(),
+            )
+        })?;
+        ms.push(Arc::new(Metric::new(
+            metric_from_proto(inner, codec)?,
+            partition,
+        )));
+    }
+    Ok(ms)
+}
+
 impl TryInto<MetricsSet> for protobuf::OperatorMetricsSet {
     type Error = BallistaError;
 
     fn try_into(self) -> Result<MetricsSet, Self::Error> {
-        let mut ms = MetricsSet::new();
-        for proto_metric in self.metrics {
-            let partition = proto_metric.partition.map(|p| p as usize);
-            let inner = proto_metric.metric.ok_or_else(|| {
-                BallistaError::General(
-                    "scheduler::from_proto(OperatorMetric) metric is None.".to_owned(),
-                )
-            })?;
-            let value: MetricValue = inner.try_into()?;
-            ms.push(Arc::new(Metric::new(value, partition)));
-        }
-        Ok(ms)
+        metrics_set_from_proto(self, None)
     }
 }
 

@@ -27,12 +27,14 @@ use crate::executor_process::remove_job_data;
 use crate::{TaskCompletionExtras, TaskExecutionTimes, as_task_status};
 use ballista_core::JobId;
 use ballista_core::error::BallistaError;
+use ballista_core::extension::SessionConfigExt;
 use ballista_core::extension::SessionConfigHelperExt;
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::{
     PollWorkParams, PollWorkResult, TaskDefinition, TaskStatus,
     scheduler_grpc_client::SchedulerGrpcClient,
 };
+use ballista_core::serde::scheduler::to_proto::metrics_set_to_proto;
 use ballista_core::serde::scheduler::{ExecutorSpecification, TaskKey};
 use ballista_core::utils::redact_key_value_pairs;
 use datafusion::execution::context::TaskContext;
@@ -42,7 +44,6 @@ use datafusion_proto::physical_plan::AsExecutionPlan;
 use futures::FutureExt;
 use log::{debug, error, info, trace, warn};
 use std::any::Any;
-use std::convert::TryInto;
 use std::error::Error;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -378,6 +379,7 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
     );
     let session_config = executor.produce_config();
     let session_config = session_config.update_from_key_value_pair(&task.props);
+    let metric_codec = session_config.ballista_custom_metric_codec();
 
     let task_scalar_functions = executor.function_registry.scalar_functions.clone();
     let task_aggregate_functions = executor.function_registry.aggregate_functions.clone();
@@ -457,7 +459,7 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
         let plan_metrics = query_stage_exec.collect_plan_metrics();
         let operator_metrics = plan_metrics
             .into_iter()
-            .map(|m| m.try_into())
+            .map(|m| metrics_set_to_proto(&m, metric_codec.as_deref()))
             .collect::<Result<Vec<_>, BallistaError>>()
             .ok();
         let runtime_stats = query_stage_exec.collect_runtime_stats_reports();

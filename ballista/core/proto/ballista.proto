@@ -830,6 +830,10 @@ message NamedCustom {
   string display = 2;
   // The value's `as_usize()`.
   uint64 value = 3;
+  // Set by a `CustomMetricCodec` on the executor: names the metric type, so
+  // the codec on the scheduler can rebuild it from `encoded`.
+  string type_tag = 4;
+  bytes encoded = 5;
 }
 
 message OperatorMetric {

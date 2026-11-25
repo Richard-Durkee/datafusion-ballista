@@ -17,19 +17,43 @@
 
 //! A [`CustomMetricValue`] that survives the trip from executor to scheduler.
 
+use datafusion::error::Result;
 use datafusion::physical_plan::metrics::CustomMetricValue;
 use parking_lot::Mutex;
 use std::any::Any;
 use std::fmt::{self, Debug, Display};
 use std::sync::Arc;
 
+/// Sends custom metric values from the executor to the scheduler as their own
+/// type, so the scheduler aggregates and renders them as the operator does.
+///
+/// Register the same codec on the executor and the scheduler with
+/// [`SessionConfigExt::with_ballista_custom_metric_codec`], next to the
+/// physical extension codec that ships the operator itself. Values the codec
+/// does not encode are sent as a [`SerializedCustomMetricValue`] snapshot.
+///
+/// [`SessionConfigExt::with_ballista_custom_metric_codec`]: crate::extension::SessionConfigExt::with_ballista_custom_metric_codec
+pub trait CustomMetricCodec: Debug + Send + Sync {
+    /// Encodes `value`, returning a tag naming its type and its bytes, or
+    /// `None` if this codec does not know the type.
+    fn try_encode(&self, value: &dyn CustomMetricValue) -> Option<(String, Vec<u8>)>;
+
+    /// Rebuilds a value encoded by [`Self::try_encode`] with `type_tag`.
+    fn try_decode(
+        &self,
+        type_tag: &str,
+        encoded: &[u8],
+    ) -> Result<Arc<dyn CustomMetricValue>>;
+}
+
 /// Snapshot of a [`MetricValue::Custom`] taken on the executor.
 ///
 /// The executor's concrete `dyn CustomMetricValue` type does not exist on the
 /// scheduler, so only its `Display` output and `as_usize()` cross the wire.
 /// A single snapshot renders as the executor rendered it. Snapshots that are
-/// aggregated together render as the sum of their `as_usize()` values, since
-/// the rendered strings cannot be merged.
+/// aggregated together render as the number of values, since a total would
+/// assume the type adds up. Register a [`CustomMetricCodec`] to aggregate them
+/// as the executor's type does.
 ///
 /// [`MetricValue::Custom`]: datafusion::physical_plan::metrics::MetricValue::Custom
 #[derive(Debug)]
@@ -65,10 +89,12 @@ impl SerializedCustomMetricValue {
 impl Display for SerializedCustomMetricValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state = self.state.lock();
+        // How the executor's type aggregates is not known here, so
+        // aggregated snapshots are counted rather than given a total.
         if state.snapshots == 1 {
             f.write_str(&state.display)
         } else {
-            write!(f, "{}", state.value)
+            write!(f, "{} values", state.snapshots)
         }
     }
 }
@@ -122,6 +148,8 @@ impl CustomMetricValue for SerializedCustomMetricValue {
 mod tests {
     use super::*;
     use crate::serde::protobuf;
+    use crate::serde::scheduler::from_proto::metrics_set_from_proto;
+    use crate::serde::scheduler::to_proto::metrics_set_to_proto;
     use datafusion::physical_plan::Metric;
     use datafusion::physical_plan::metrics::{Count, MetricValue, MetricsSet};
     use std::borrow::Cow;
@@ -157,6 +185,80 @@ mod tests {
         fn is_eq(&self, other: &Arc<dyn CustomMetricValue>) -> bool {
             other.as_usize() == self.as_usize()
         }
+    }
+
+    /// A metric that keeps the largest value, which a sum would get wrong.
+    #[derive(Debug, Default)]
+    struct PeakBytes(AtomicUsize);
+
+    impl Display for PeakBytes {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{} B", self.0.load(Ordering::Relaxed))
+        }
+    }
+
+    impl CustomMetricValue for PeakBytes {
+        fn new_empty(&self) -> Arc<dyn CustomMetricValue> {
+            Arc::new(Self::default())
+        }
+
+        fn aggregate(&self, other: Arc<dyn CustomMetricValue + 'static>) {
+            self.0.fetch_max(other.as_usize(), Ordering::Relaxed);
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_usize(&self) -> usize {
+            self.0.load(Ordering::Relaxed)
+        }
+
+        fn is_eq(&self, other: &Arc<dyn CustomMetricValue>) -> bool {
+            other.as_usize() == self.as_usize()
+        }
+    }
+
+    /// Encodes `PeakBytes` as its value in little-endian bytes.
+    #[derive(Debug)]
+    struct PeakBytesCodec;
+
+    impl CustomMetricCodec for PeakBytesCodec {
+        fn try_encode(&self, value: &dyn CustomMetricValue) -> Option<(String, Vec<u8>)> {
+            let peak = value.as_any().downcast_ref::<PeakBytes>()?;
+            let bytes = (peak.0.load(Ordering::Relaxed) as u64).to_le_bytes();
+            Some(("peak_bytes".to_string(), bytes.to_vec()))
+        }
+
+        fn try_decode(
+            &self,
+            type_tag: &str,
+            encoded: &[u8],
+        ) -> Result<Arc<dyn CustomMetricValue>> {
+            if type_tag != "peak_bytes" {
+                return datafusion::common::internal_err!("unknown tag {type_tag}");
+            }
+            let bytes: [u8; 8] = encoded.try_into().map_err(|_| {
+                datafusion::common::internal_datafusion_err!("bad peak_bytes")
+            })?;
+            Ok(Arc::new(PeakBytes(AtomicUsize::new(
+                u64::from_le_bytes(bytes) as usize,
+            ))))
+        }
+    }
+
+    fn peaks() -> MetricsSet {
+        let mut metrics = MetricsSet::new();
+        for (partition, bytes) in [(0, 100), (1, 300), (2, 200)] {
+            metrics.push(Arc::new(Metric::new(
+                MetricValue::Custom {
+                    name: Cow::Borrowed("peak"),
+                    value: Arc::new(PeakBytes(AtomicUsize::new(bytes))),
+                },
+                Some(partition),
+            )));
+        }
+        metrics
     }
 
     fn millis(value: usize) -> MetricValue {
@@ -204,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregated_snapshots_render_as_their_sum() {
+    fn aggregated_snapshots_render_as_a_count_without_a_codec() {
         let mut metrics = MetricsSet::new();
         metrics.push(Arc::new(Metric::new(millis(12), Some(0))));
         metrics.push(Arc::new(Metric::new(millis(30), Some(1))));
@@ -213,7 +315,7 @@ mod tests {
         let metric = aggregated.iter().next().unwrap();
 
         assert_eq!(metric.value().as_usize(), 42);
-        assert_eq!(metric.value().to_string(), "42");
+        assert_eq!(metric.value().to_string(), "2 values");
     }
 
     #[test]
@@ -237,5 +339,54 @@ mod tests {
 
         assert!(a.is_eq(&same));
         assert!(!a.is_eq(&different));
+    }
+
+    #[test]
+    fn codec_rebuilds_the_executors_type_on_the_scheduler() {
+        let codec: &dyn CustomMetricCodec = &PeakBytesCodec;
+        let proto = metrics_set_to_proto(&peaks(), Some(codec)).unwrap();
+        let metrics = metrics_set_from_proto(proto, Some(codec)).unwrap();
+
+        let first = metrics.iter().next().unwrap();
+        let MetricValue::Custom { value, .. } = first.value() else {
+            panic!("expected a custom metric");
+        };
+        assert!(value.as_any().downcast_ref::<PeakBytes>().is_some());
+
+        // The type's own aggregate keeps the maximum, and its own Display
+        // keeps the unit.
+        let aggregated = metrics.aggregate_by_name();
+        assert_eq!(
+            aggregated.iter().next().unwrap().value().to_string(),
+            "300 B"
+        );
+    }
+
+    #[test]
+    fn scheduler_without_the_codec_falls_back_to_snapshots() {
+        let proto = metrics_set_to_proto(&peaks(), Some(&PeakBytesCodec)).unwrap();
+        let metrics = metrics_set_from_proto(proto, None).unwrap();
+
+        assert_eq!(metrics.iter().next().unwrap().value().to_string(), "100 B");
+        let aggregated = metrics.aggregate_by_name();
+        assert_eq!(
+            aggregated.iter().next().unwrap().value().to_string(),
+            "3 values"
+        );
+    }
+
+    #[test]
+    fn codec_skips_types_it_does_not_know() {
+        let mut metrics = MetricsSet::new();
+        metrics.push(Arc::new(Metric::new(millis(12), Some(0))));
+
+        let proto = metrics_set_to_proto(&metrics, Some(&PeakBytesCodec)).unwrap();
+        let Some(protobuf::operator_metric::Metric::Custom(custom)) =
+            &proto.metrics[0].metric
+        else {
+            panic!("expected a custom metric");
+        };
+        assert!(custom.type_tag.is_empty());
+        assert_eq!(custom.display, "12 ms");
     }
 }

@@ -26,6 +26,7 @@ use crate::error::BallistaError;
 use crate::serde::protobuf::{self, NamedPruningMetrics, NamedRatio};
 use datafusion_proto::protobuf as datafusion_protobuf;
 
+use crate::serde::scheduler::custom_metric::CustomMetricCodec;
 use crate::serde::scheduler::{
     Action, ExecutorData, ExecutorEndpoint, ExecutorOperatingSystemSpecification,
     ExecutorSpecification, PartitionId, PartitionLocation, PartitionStats,
@@ -351,27 +352,54 @@ impl TryInto<operator_metric::Metric> for &MetricValue {
                     name: name.to_string(),
                     display: value.to_string(),
                     value: value.as_usize() as u64,
+                    ..Default::default()
                 }))
             }
         }
     }
 }
 
+/// Encodes `value`, using `codec` for the custom metric types it knows.
+pub fn metric_to_proto(
+    value: &MetricValue,
+    codec: Option<&dyn CustomMetricCodec>,
+) -> Result<operator_metric::Metric, BallistaError> {
+    if let (MetricValue::Custom { name, value }, Some(codec)) = (value, codec)
+        && let Some((type_tag, encoded)) = codec.try_encode(value.as_ref())
+    {
+        return Ok(operator_metric::Metric::Custom(NamedCustom {
+            name: name.to_string(),
+            display: value.to_string(),
+            value: value.as_usize() as u64,
+            type_tag,
+            encoded,
+        }));
+    }
+    value.try_into()
+}
+
+/// Encodes `metrics`, using `codec` for the custom metric types it knows.
+pub fn metrics_set_to_proto(
+    metrics: &MetricsSet,
+    codec: Option<&dyn CustomMetricCodec>,
+) -> Result<protobuf::OperatorMetricsSet, BallistaError> {
+    let metrics = metrics
+        .iter()
+        .map(|m| {
+            Ok(protobuf::OperatorMetric {
+                metric: Some(metric_to_proto(m.value(), codec)?),
+                partition: m.partition().map(|p| p as u32),
+            })
+        })
+        .collect::<Result<Vec<_>, BallistaError>>()?;
+    Ok(protobuf::OperatorMetricsSet { metrics })
+}
+
 impl TryInto<protobuf::OperatorMetricsSet> for MetricsSet {
     type Error = BallistaError;
 
     fn try_into(self) -> Result<protobuf::OperatorMetricsSet, Self::Error> {
-        let metrics = self
-            .iter()
-            .map(|m| {
-                let metric: operator_metric::Metric = m.value().try_into()?;
-                Ok(protobuf::OperatorMetric {
-                    metric: Some(metric),
-                    partition: m.partition().map(|p| p as u32),
-                })
-            })
-            .collect::<Result<Vec<_>, BallistaError>>()?;
-        Ok(protobuf::OperatorMetricsSet { metrics })
+        metrics_set_to_proto(&self, None)
     }
 }
 

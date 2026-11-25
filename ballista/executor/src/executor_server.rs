@@ -22,8 +22,9 @@
 //! heartbeat communication, and status reporting.
 
 use ballista_core::BALLISTA_VERSION;
+use ballista_core::extension::SessionConfigExt;
+use ballista_core::serde::scheduler::to_proto::metrics_set_to_proto;
 use std::collections::{HashMap, HashSet};
-use std::convert::TryInto;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -450,6 +451,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
             )
         };
 
+        let metric_codec = task.session_config.ballista_custom_metric_codec();
         match (exec, runtime) {
             (Ok(exec), Ok(runtime)) => {
                 let task_context = {
@@ -485,7 +487,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
                 let plan_metrics = exec.collect_plan_metrics();
                 let operator_metrics = plan_metrics
                     .into_iter()
-                    .map(|m| m.try_into())
+                    .map(|m| metrics_set_to_proto(&m, metric_codec.as_deref()))
                     .collect::<Result<Vec<_>, BallistaError>>()
                     .ok();
                 let runtime_stats = exec.collect_runtime_stats_reports();
