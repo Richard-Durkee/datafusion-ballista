@@ -1743,8 +1743,8 @@ mod tests {
     use ballista_core::JobId;
     use ballista_core::hll::DEFAULT_PRECISION;
     use ballista_core::serde::protobuf::{
-        ColumnSketch, NamedCustom, OperatorMetric, SuccessfulTask, TaskColumnStats,
-        TaskStatus, operator_metric, task_status,
+        ColumnSketch, CustomMetricAggregation, NamedCustom, OperatorMetric,
+        SuccessfulTask, TaskColumnStats, TaskStatus, operator_metric, task_status,
     };
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::prelude::SessionConfig;
@@ -2116,6 +2116,7 @@ mod tests {
                     name: "io_wait".to_string(),
                     display: format!("{io_wait_ms} ms"),
                     value: io_wait_ms,
+                    aggregation: CustomMetricAggregation::Sum as i32,
                 })),
                 partition: Some(0),
             });

@@ -1189,6 +1189,9 @@ pub struct NamedCustom {
     /// The value's `as_usize()`.
     #[prost(uint64, tag = "3")]
     pub value: u64,
+    /// How values from several partitions or tasks combine.
+    #[prost(enumeration = "CustomMetricAggregation", tag = "4")]
+    pub aggregation: i32,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -2340,6 +2343,41 @@ impl ShuffleFileKind {
         match value {
             "SHUFFLE_FILE_KIND_DATA" => Some(Self::Data),
             "SHUFFLE_FILE_KIND_INDEX" => Some(Self::Index),
+            _ => None,
+        }
+    }
+}
+/// How the scheduler combines `NamedCustom` values from several partitions or
+/// tasks. The executor works it out by aggregating the value into an empty one.
+#[allow(clippy::all)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum CustomMetricAggregation {
+    /// Not known. Aggregated values are not rendered as a total.
+    Unknown = 0,
+    /// Aggregating adds the values.
+    Sum = 1,
+    /// Aggregating keeps the larger value.
+    Max = 2,
+}
+impl CustomMetricAggregation {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unknown => "CUSTOM_METRIC_AGGREGATION_UNKNOWN",
+            Self::Sum => "CUSTOM_METRIC_AGGREGATION_SUM",
+            Self::Max => "CUSTOM_METRIC_AGGREGATION_MAX",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CUSTOM_METRIC_AGGREGATION_UNKNOWN" => Some(Self::Unknown),
+            "CUSTOM_METRIC_AGGREGATION_SUM" => Some(Self::Sum),
+            "CUSTOM_METRIC_AGGREGATION_MAX" => Some(Self::Max),
             _ => None,
         }
     }

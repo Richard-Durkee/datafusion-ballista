@@ -830,6 +830,19 @@ message NamedCustom {
   string display = 2;
   // The value's `as_usize()`.
   uint64 value = 3;
+  // How values from several partitions or tasks combine.
+  CustomMetricAggregation aggregation = 4;
+}
+
+// How the scheduler combines `NamedCustom` values from several partitions or
+// tasks. The executor works it out by aggregating the value into an empty one.
+enum CustomMetricAggregation {
+  // Not known. Aggregated values are not rendered as a total.
+  CUSTOM_METRIC_AGGREGATION_UNKNOWN = 0;
+  // Aggregating adds the values.
+  CUSTOM_METRIC_AGGREGATION_SUM = 1;
+  // Aggregating keeps the larger value.
+  CUSTOM_METRIC_AGGREGATION_MAX = 2;
 }
 
 message OperatorMetric {

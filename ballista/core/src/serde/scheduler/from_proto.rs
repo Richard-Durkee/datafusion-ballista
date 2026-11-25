@@ -34,7 +34,9 @@ use std::time::Duration;
 
 use crate::error::BallistaError;
 use crate::extension::SessionConfigHelperExt;
-use crate::serde::protobuf::{NamedCustom, NamedPruningMetrics, NamedRatio};
+use crate::serde::protobuf::{
+    CustomMetricAggregation, NamedCustom, NamedPruningMetrics, NamedRatio,
+};
 use crate::serde::scheduler::custom_metric::SerializedCustomMetricValue;
 use crate::serde::scheduler::{
     Action, BallistaFunctionRegistry, ByteRange, ExecutorData, ExecutorEndpoint,
@@ -371,11 +373,14 @@ impl TryInto<MetricValue> for operator_metric::Metric {
                 name,
                 display,
                 value,
+                aggregation,
             }) => Ok(MetricValue::Custom {
                 name: name.into(),
                 value: Arc::new(SerializedCustomMetricValue::new(
                     display,
                     value as usize,
+                    CustomMetricAggregation::try_from(aggregation)
+                        .unwrap_or(CustomMetricAggregation::Unknown),
                 )),
             }),
         }

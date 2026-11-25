@@ -26,6 +26,7 @@ use crate::error::BallistaError;
 use crate::serde::protobuf::{self, NamedPruningMetrics, NamedRatio};
 use datafusion_proto::protobuf as datafusion_protobuf;
 
+use crate::serde::scheduler::custom_metric::probe_aggregation;
 use crate::serde::scheduler::{
     Action, ExecutorData, ExecutorEndpoint, ExecutorOperatingSystemSpecification,
     ExecutorSpecification, PartitionId, PartitionLocation, PartitionStats,
@@ -351,6 +352,7 @@ impl TryInto<operator_metric::Metric> for &MetricValue {
                     name: name.to_string(),
                     display: value.to_string(),
                     value: value.as_usize() as u64,
+                    aggregation: probe_aggregation(value) as i32,
                 }))
             }
         }
