@@ -1064,6 +1064,25 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                             metrics: operator_metrics,
                             ..
                         } = task_status;
+
+                        // A finished task's metrics feed the plan display
+                        // and the REST API, a failed one's too, as they show
+                        // the work it did. Metrics that can't be merged must
+                        // not change the task's outcome: failing here would
+                        // drop its status and leave the stage, and the job,
+                        // unfinished.
+                        if matches!(
+                            status,
+                            Some(
+                                task_status::Status::Successful(_)
+                                    | task_status::Status::Failed(_)
+                            )
+                        ) && let Err(e) =
+                            running_stage.update_task_metrics(task_id, operator_metrics)
+                        {
+                            running_stage.log_skipped_metrics(&job_id, task_id, &e);
+                        }
+
                         //
                         // handle task failure
                         //
@@ -1192,16 +1211,6 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                             successful_task,
                         )) = status
                         {
-                            // Metrics only feed the plan display and the REST
-                            // API. A task whose metrics can't be merged still
-                            // succeeded, and failing here would drop its status
-                            // and leave the stage, and the job, unfinished.
-                            if let Err(e) = running_stage
-                                .update_task_metrics(task_id, operator_metrics)
-                            {
-                                running_stage.log_skipped_metrics(&job_id, task_id, &e);
-                            }
-
                             let ballista_core::serde::protobuf::SuccessfulTask {
                                 partitions,
                                 runtime_stats,

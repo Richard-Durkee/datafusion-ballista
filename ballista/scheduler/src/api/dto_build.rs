@@ -505,7 +505,9 @@ impl StageMetricSlots {
 
 /// Sum the metrics named `name` in one operator's [`MetricsSet`], restricted to
 /// the given global partitions when `partitions` is `Some`. Metrics with no
-/// partition only count towards the unrestricted total.
+/// partition only count towards the unrestricted total. A task's metrics have
+/// none only when the task covers no partitions: the scheduler tags a
+/// task-wide metric with the task's first partition.
 fn sum_metric(metrics: &MetricsSet, name: &str, partitions: Option<&[usize]>) -> usize {
     metrics
         .iter()

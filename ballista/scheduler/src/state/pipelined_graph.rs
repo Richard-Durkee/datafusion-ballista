@@ -758,13 +758,16 @@ impl ExecutionGraph for PipelinedExecutionGraph {
             if !stage.update_task_info(task_id, status) {
                 continue;
             }
+            // A failed task's metrics are kept too, as they show the work it
+            // did. Metrics that can't be merged don't change the task's outcome.
+            if matches!(
+                outcome,
+                Some(task_status::Status::Successful(_) | task_status::Status::Failed(_))
+            ) && let Err(e) = stage.update_task_metrics(task_id, metrics)
+            {
+                stage.log_skipped_metrics(&self.job_id, task_id, &e);
+            }
             match outcome {
-                Some(task_status::Status::Successful(_)) => {
-                    // A task whose metrics can't be merged still succeeded.
-                    if let Err(e) = stage.update_task_metrics(task_id, metrics) {
-                        stage.log_skipped_metrics(&self.job_id, task_id, &e);
-                    }
-                }
                 Some(task_status::Status::Failed(failed)) => {
                     failure.get_or_insert_with(|| {
                         // Cache data is another job's output: say so, so the
