@@ -1020,14 +1020,17 @@ impl RunningStage {
             }));
     }
 
-    /// Merges a successful task's operator metrics into the stage metrics.
+    /// Merges a task's operator metrics into the stage metrics, replacing
+    /// what earlier attempts at the task's partitions reported. Successful
+    /// and failed tasks both report metrics.
     ///
     /// A task reports one metrics set per operator of the plan it ran. The
     /// scheduler restricts each task's copy of the stage plan to the task's
     /// partitions, and that can change the shape, for example by swapping an
     /// `EmptyExec` without metrics for a stand-in source with them. Such a
     /// task's metrics would not line up with the stage plan, so they are
-    /// skipped with an error. The check is against the stage plan, not
+    /// skipped with an error, and the stage metrics of the task's partitions
+    /// are removed. The check is against the stage plan, not
     /// against the first task to report, so the tasks that match the plan
     /// always merge.
     pub fn update_task_metrics(
@@ -1035,9 +1038,25 @@ impl RunningStage {
         task_id: usize,
         metrics: Vec<OperatorMetricsSet>,
     ) -> Result<()> {
+        let merged = self.merge_task_metrics(task_id, metrics);
+        // Metrics that can't be merged still replace what earlier attempts at
+        // the task's partitions reported, so an earlier attempt's partial
+        // numbers never stand in for this task's.
+        if !matches!(merged, Ok(true)) {
+            self.clear_task_metrics(task_id);
+        }
+        merged.map(|_| ())
+    }
+
+    /// Merges a task's metrics; `Ok(false)` when the task reported none.
+    fn merge_task_metrics(
+        &mut self,
+        task_id: usize,
+        metrics: Vec<OperatorMetricsSet>,
+    ) -> Result<bool> {
         // For some cases, task metrics not set, especially for testings.
         if metrics.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         if metrics.len() != self.plan_metrics_len {
@@ -1079,7 +1098,20 @@ impl RunningStage {
         };
         self.stage_metrics = Some(new_metrics_set);
 
-        Ok(())
+        Ok(true)
+    }
+
+    /// Removes the stage metrics of the partitions task `task_id` covers.
+    fn clear_task_metrics(&mut self, task_id: usize) {
+        let Some(stage_metrics) = &mut self.stage_metrics else {
+            return;
+        };
+        let partitions = &self.task_infos[task_id].global_input_partition_ids;
+        for metrics in stage_metrics.iter_mut() {
+            let cleared =
+                Self::upsert_metrics_set_for_task(metrics, MetricsSet::new(), partitions);
+            *metrics = cleared;
+        }
     }
 
     /// Logs that `error` made `update_task_metrics` skip the metrics of
@@ -1111,7 +1143,7 @@ impl RunningStage {
     /// each metric's local partition index to a stage-global partition id via
     /// `global_partitions` (the task's slice of stage-global partition ids).
     ///
-    /// Three cases, keyed on the local partition value the executor put on
+    /// Four cases, keyed on the local partition value the executor put on
     /// the wire:
     ///
     /// 1. `local < global_partitions.len()` — restricted-arm metric (see
@@ -1128,6 +1160,9 @@ impl RunningStage {
     ///    slice member so the aggregate mirrors what master reported
     ///    (`N tasks × 1 task-partition each = N buckets, 1 bucket per
     ///    stage-global partition`).
+    /// 4. no partition — a metric of the whole task. It is tagged with the
+    ///    task's first partition, so the next report for that partition
+    ///    replaces it instead of adding a second copy.
     ///
     /// TODO(#2038 metrics story): neither master nor this design is
     /// actually *correct*. Master's per-partition attribution was a lie in
@@ -1172,7 +1207,10 @@ impl RunningStage {
                     vec![Some(global_partitions[0])]
                 }
                 Some(_) => global_partitions.iter().map(|&p| Some(p)).collect(),
-                None => vec![None],
+                // A metric of the whole task belongs to its first partition,
+                // so the task's next report replaces it rather than adding a
+                // second copy.
+                None => vec![global_partitions.first().copied()],
             };
             for tag in tags {
                 metrics_set.push(Arc::new(Metric::new(metric_value.clone(), tag)));
@@ -2093,6 +2131,91 @@ mod tests {
 
         // Should gracefully reject the update, not panic.
         assert!(!result);
+    }
+
+    /// A metric without a partition belongs to the task that reported it, so
+    /// the task's next report replaces it. Before, every report added a copy.
+    #[test]
+    fn test_update_task_metrics_replaces_a_tasks_unpartitioned_metrics() {
+        let mut stage = make_running_stage(2);
+        append_running_task(&mut stage, 0, "executor-1", vec![1]);
+        let unpartitioned = |rows| OperatorMetricsSet {
+            metrics: vec![OperatorMetric {
+                metric: Some(operator_metric::Metric::OutputRows(rows)),
+                partition: None,
+            }],
+        };
+
+        stage
+            .update_task_metrics(0, vec![unpartitioned(4)])
+            .unwrap();
+        stage
+            .update_task_metrics(0, vec![unpartitioned(6)])
+            .unwrap();
+
+        let metrics = &stage.stage_metrics.as_ref().unwrap()[0];
+        assert_eq!(metrics.iter().count(), 1);
+        assert_eq!(metrics.aggregate_by_name().output_rows(), Some(6));
+        assert_eq!(metrics.iter().next().unwrap().partition(), Some(1));
+    }
+
+    /// An earlier attempt's metrics are replaced by the next task over the
+    /// same partitions, also when that task's metrics can't be merged.
+    #[test]
+    fn test_update_task_metrics_replaces_an_earlier_attempts_metrics() {
+        let mut stage = make_running_stage(2);
+        append_running_task(&mut stage, 0, "executor-1", vec![0, 1]);
+        append_running_task(&mut stage, 1, "executor-1", vec![0]);
+        append_running_task(&mut stage, 2, "executor-1", vec![1]);
+        let output_rows = |stage: &RunningStage| {
+            stage.stage_metrics.as_ref().unwrap()[0]
+                .aggregate_by_name()
+                .output_rows()
+        };
+
+        // the earlier attempt over [0, 1]
+        stage
+            .update_task_metrics(
+                0,
+                vec![OperatorMetricsSet {
+                    metrics: [0, 1]
+                        .into_iter()
+                        .flat_map(|p| make_operator_metrics_set_at(p, 50, 1).metrics)
+                        .collect(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(output_rows(&stage), Some(100));
+
+        // the retry over [0] reports metrics of another shape
+        assert!(
+            stage
+                .update_task_metrics(1, vec![make_operator_metrics_set(7, 1); 2])
+                .is_err()
+        );
+        assert_eq!(output_rows(&stage), Some(50));
+
+        // the retry over [1] reports a metric this scheduler can't read
+        assert!(
+            stage
+                .update_task_metrics(
+                    2,
+                    vec![OperatorMetricsSet {
+                        metrics: vec![OperatorMetric {
+                            metric: None,
+                            partition: Some(0),
+                        }],
+                    }],
+                )
+                .is_err()
+        );
+        assert_eq!(output_rows(&stage), None);
+
+        // and then metrics that merge
+        stage
+            .update_task_metrics(2, vec![make_operator_metrics_set(30, 1)])
+            .unwrap();
+        assert_eq!(output_rows(&stage), Some(30));
     }
 
     #[test]

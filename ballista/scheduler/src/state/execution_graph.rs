@@ -987,6 +987,14 @@ impl ExecutionGraph for StaticExecutionGraph {
                         } = task_status;
 
                         if let Some(task_status::Status::Failed(failed_task)) = status {
+                            // A failed task's metrics show the work it did
+                            // before it failed. The next task over the same
+                            // partitions replaces them.
+                            if let Err(e) = running_stage
+                                .update_task_metrics(task_id, operator_metrics)
+                            {
+                                running_stage.log_skipped_metrics(&job_id, task_id, &e);
+                            }
                             let failed_reason = failed_task.failed_reason;
 
                             match failed_reason {
@@ -2641,6 +2649,55 @@ mod test {
 
         drain_tasks(&mut agg_graph)?;
         assert!(agg_graph.is_successful(), "Failed to complete agg plan");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_failed_task_metrics_are_kept() -> Result<()> {
+        use ballista_core::serde::protobuf::{
+            ExecutionError, OperatorMetric, OperatorMetricsSet, operator_metric,
+        };
+
+        let executor = mock_executor("executor-id-123".to_string());
+        let mut agg_graph = test_aggregation_plan(4).await;
+        agg_graph.revive();
+
+        let task = agg_graph.pop_next_task(&executor.id)?.unwrap();
+        let stage_id = task.key.stage_id;
+        let plan_metrics_len = match agg_graph.stages().get(&stage_id) {
+            Some(ExecutionStage::Running(stage)) => stage.plan_metrics_len,
+            _ => panic!("expected stage {stage_id} to be running"),
+        };
+        let mut status = mock_failed_task(
+            task,
+            FailedTask {
+                error: "boom".to_string(),
+                retryable: false,
+                count_to_failures: false,
+                failed_reason: Some(failed_task::FailedReason::ExecutionError(
+                    ExecutionError {},
+                )),
+            },
+        );
+        let rows_before_failing = OperatorMetricsSet {
+            metrics: vec![OperatorMetric {
+                metric: Some(operator_metric::Metric::OutputRows(7)),
+                partition: Some(0),
+            }],
+        };
+        status.metrics = vec![rows_before_failing; plan_metrics_len];
+
+        agg_graph.update_task_status(&executor, vec![status], 4, 4)?;
+
+        let stage_metrics = match agg_graph.stages().get(&stage_id) {
+            Some(ExecutionStage::Running(stage)) => stage.stage_metrics.clone(),
+            Some(ExecutionStage::Failed(stage)) => stage.stage_metrics.clone(),
+            other => panic!("unexpected stage {stage_id}: {other:?}"),
+        }
+        .expect("the failed task's metrics are kept");
+        assert_eq!(stage_metrics.len(), plan_metrics_len);
+        assert_eq!(stage_metrics[0].aggregate_by_name().output_rows(), Some(7));
 
         Ok(())
     }

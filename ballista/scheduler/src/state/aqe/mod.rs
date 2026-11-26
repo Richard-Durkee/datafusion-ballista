@@ -1067,6 +1067,14 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                         // handle task failure
                         //
                         if let Some(task_status::Status::Failed(failed_task)) = status {
+                            // A failed task's metrics show the work it did
+                            // before it failed. The next task over the same
+                            // partitions replaces them.
+                            if let Err(e) = running_stage
+                                .update_task_metrics(task_id, operator_metrics)
+                            {
+                                running_stage.log_skipped_metrics(&job_id, task_id, &e);
+                            }
                             let failed_reason = failed_task.failed_reason;
 
                             match failed_reason {

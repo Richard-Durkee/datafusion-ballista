@@ -766,6 +766,10 @@ impl ExecutionGraph for PipelinedExecutionGraph {
                     }
                 }
                 Some(task_status::Status::Failed(failed)) => {
+                    // Kept so a failed job shows the work its tasks did.
+                    if let Err(e) = stage.update_task_metrics(task_id, metrics) {
+                        stage.log_skipped_metrics(&self.job_id, task_id, &e);
+                    }
                     failure.get_or_insert_with(|| {
                         // Cache data is another job's output: say so, so the
                         // lost build is dropped and a retry rebuilds it.
