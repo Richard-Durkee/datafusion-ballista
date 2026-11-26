@@ -1968,6 +1968,15 @@ pub struct JobStageMetrics {
     pub partitions: u32,
     #[prost(message, repeated, tag = "3")]
     pub operators: ::prost::alloc::vec::Vec<OperatorWithMetrics>,
+    /// Whether the stage finished or failed. A failed stage carries the metrics
+    /// of the tasks that succeeded before it failed.
+    #[prost(enumeration = "JobStageState", tag = "4")]
+    pub state: i32,
+    /// For a failed stage, the job's failure reason. Every stage the job was
+    /// running when it failed or was cancelled carries the same reason, so it
+    /// need not be this stage's own error. Empty for a successful stage.
+    #[prost(string, tag = "5")]
+    pub error: ::prost::alloc::string::String,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2337,6 +2346,33 @@ impl SketchType {
         match value {
             "SKETCH_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
             "SKETCH_TYPE_HLL" => Some(Self::Hll),
+            _ => None,
+        }
+    }
+}
+#[allow(clippy::all)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum JobStageState {
+    Successful = 0,
+    Failed = 1,
+}
+impl JobStageState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Successful => "JOB_STAGE_STATE_SUCCESSFUL",
+            Self::Failed => "JOB_STAGE_STATE_FAILED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "JOB_STAGE_STATE_SUCCESSFUL" => Some(Self::Successful),
+            "JOB_STAGE_STATE_FAILED" => Some(Self::Failed),
             _ => None,
         }
     }

@@ -1331,10 +1331,22 @@ message GetJobMetricsParams {
   string job_id = 1;
 }
 
+enum JobStageState {
+  JOB_STAGE_STATE_SUCCESSFUL = 0;
+  JOB_STAGE_STATE_FAILED = 1;
+}
+
 message JobStageMetrics {
   uint32 stage_id = 1;
   uint32 partitions = 2;
   repeated OperatorWithMetrics operators = 3;
+  // Whether the stage finished or failed. A failed stage carries the metrics
+  // of the tasks that succeeded before it failed.
+  JobStageState state = 4;
+  // For a failed stage, the job's failure reason. Every stage the job was
+  // running when it failed or was cancelled carries the same reason, so it
+  // need not be this stage's own error. Empty for a successful stage.
+  string error = 5;
 }
 
 message OperatorWithMetrics {

@@ -318,7 +318,6 @@ pub struct FailedStage {
     /// Append-only, indexed by task_id (bind order).
     pub task_infos: Vec<TaskInfo>,
     /// Combined metrics of the already finished tasks in the stage, If it is None, no task is finished yet.
-    #[allow(dead_code)] // not used at the moment, will be used later
     pub stage_metrics: Option<Vec<MetricsSet>>,
     /// Error message
     pub error_message: String,

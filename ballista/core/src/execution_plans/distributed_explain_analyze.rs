@@ -271,10 +271,26 @@ pub(crate) fn format_job_plan(
         .iter()
         .map(|stage| {
             let mut stage_plan = Vec::with_capacity(stage.operators.len() + 1);
-            stage_plan.push(format!(
-                "=========SuccessfulStage[stage_id={}, partitions={}]=========",
-                stage.stage_id, stage.partitions
-            ));
+            let header = if stage.state() == protobuf::JobStageState::Failed {
+                // The job's error ends in a newline and may span several lines
+                let error = stage
+                    .error
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!(
+                    "=========FailedStage[stage_id={}, partitions={}, error={error}]=========",
+                    stage.stage_id, stage.partitions
+                )
+            } else {
+                format!(
+                    "=========SuccessfulStage[stage_id={}, partitions={}]=========",
+                    stage.stage_id, stage.partitions
+                )
+            };
+            stage_plan.push(header);
 
             for operator in &stage.operators {
                 let indent = "  ".repeat(operator.depth as usize);
@@ -336,8 +352,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::serde::protobuf::{
-        GetJobMetricsResult, JobStageMetrics, OperatorMetric, OperatorWithMetrics,
-        operator_metric,
+        GetJobMetricsResult, JobStageMetrics, JobStageState, OperatorMetric,
+        OperatorWithMetrics, operator_metric,
     };
 
     #[test]
@@ -364,10 +380,15 @@ mod tests {
                             },
                         ],
                     }],
+                    ..Default::default()
                 },
                 JobStageMetrics {
                     stage_id: 1,
                     partitions: 2,
+                    state: JobStageState::Failed as i32,
+                    error:
+                        "Job failed due to stage 1 failed: boom\n  caused by: disk full\n"
+                            .to_string(),
                     operators: vec![OperatorWithMetrics {
                         depth: 0,
                         operator_type: "FilterExec".to_string(),
@@ -387,7 +408,7 @@ mod tests {
             "=========SuccessfulStage[stage_id=0, partitions=1]=========",
             "ProjectionExec: expr=[a]",
             "",
-            "=========SuccessfulStage[stage_id=1, partitions=2]=========",
+            "=========FailedStage[stage_id=1, partitions=2, error=Job failed due to stage 1 failed: boom caused by: disk full]=========",
             "FilterExec: a@0 > 1",
         ]
         .join("\n");
@@ -423,6 +444,7 @@ mod tests {
                             },
                         ],
                     }],
+                    ..Default::default()
                 },
                 JobStageMetrics {
                     stage_id: 1,
@@ -436,6 +458,7 @@ mod tests {
                             partition: None,
                         }],
                     }],
+                    ..Default::default()
                 },
             ],
         };

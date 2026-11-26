@@ -28,7 +28,8 @@ use ballista_core::serde::protobuf::{
     ExecuteQuerySuccessResult, ExecutorHeartbeat, ExecutorRegistration,
     ExecutorStoppedParams, ExecutorStoppedResult, FailedTask, GetJobMetricsParams,
     GetJobMetricsResult, GetJobStatusParams, GetJobStatusResult, HeartBeatParams,
-    HeartBeatResult, JobStatus, KeyValuePair, PollWorkParams, PollWorkResult,
+    HeartBeatResult, JobStageMetrics, JobStageState, JobStatus, KeyValuePair,
+    OperatorMetricsSet, OperatorWithMetrics, PollWorkParams, PollWorkResult,
     RegisterExecutorParams, RegisterExecutorResult, RemoveSessionParams,
     RemoveSessionResult, TaskDefinition, TaskStatus, UpdateTaskStatusParams,
     UpdateTaskStatusResult, execute_query_failure_result, execute_query_result,
@@ -56,7 +57,9 @@ use {
 use crate::cluster::{bind_task_bias, bind_task_round_robin};
 use crate::config::TaskDistributionPolicy;
 use crate::scheduler_server::event::{QueryStageSchedulerEvent, SubmitPlan};
+use crate::state::execution_graph::ExecutionStage;
 use ballista_core::serde::protobuf::get_job_status_result::FlightProxy;
+use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{DisplayFormatType, ExecutionPlan};
 use datafusion::prelude::SessionContext;
 use std::ops::Deref;
@@ -651,98 +654,13 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
             .stages()
             .iter()
             .filter_map(|(stage_id, stage)| {
-                let successful = match stage {
-                    crate::state::execution_graph::ExecutionStage::Successful(stage) => {
-                        stage
-                    }
-                    _ => return None,
-                };
-
-                let raw_metrics = &successful.stage_metrics;
-                let mut operators = Vec::with_capacity(raw_metrics.len());
-                let mut metric_index = 0;
-                let operators = (|| -> Result<
-                    Vec<ballista_core::serde::protobuf::OperatorWithMetrics>,
-                    BallistaError,
-                > {
-                    let mut stack = vec![(successful.plan.as_ref(), 0_u32)];
-
-                    while let Some((plan, depth)) = stack.pop() {
-                        let operator_desc = {
-                            struct DisplayableOperator<'a> {
-                                plan: &'a dyn ExecutionPlan,
-                            }
-
-                            impl std::fmt::Display for DisplayableOperator<'_> {
-                                fn fmt(
-                                    &self,
-                                    f: &mut std::fmt::Formatter<'_>,
-                                ) -> std::fmt::Result {
-                                    self.plan.fmt_as(DisplayFormatType::Default, f)
-                                }
-                            }
-
-                            DisplayableOperator { plan }.to_string()
-                        };
-                        let metrics = if plan.metrics().is_some() {
-                            let metrics: ballista_core::serde::protobuf::OperatorMetricsSet =
-                                raw_metrics
-                                    .get(metric_index)
-                                    .ok_or_else(|| {
-                                        BallistaError::Internal(format!(
-                                            "Missing metrics for operator {} at depth {}",
-                                            plan.name(),
-                                            depth
-                                        ))
-                                    })?
-                                    .clone()
-                                    .try_into()?;
-                            metric_index += 1;
-                            metrics.metrics
-                        } else {
-                            vec![]
-                        };
-
-                        operators.push(
-                            ballista_core::serde::protobuf::OperatorWithMetrics {
-                                depth,
-                                operator_type: plan.name().to_string(),
-                                operator_desc,
-                                metrics,
-                            },
-                        );
-
-                        for child in plan.children().into_iter().rev() {
-                            stack.push((child.as_ref(), depth + 1));
-                        }
-                    }
-
-                    Ok(operators)
-                })()
-                .and_then(|operators| {
-                    if metric_index == raw_metrics.len() {
-                        Ok(operators)
-                    } else {
-                        Err(BallistaError::Internal(format!(
-                            "Stage metrics size mismatch for job {job_id} stage {stage_id}: operators {} != stage metrics {}",
-                            metric_index,
-                            raw_metrics.len()
-                        )))
-                    }
+                job_stage_metrics(*stage_id, stage).map(|metrics| {
+                    metrics.map_err(|e| {
+                        Status::internal(format!(
+                            "Error serializing job metrics for job {job_id} stage {stage_id}: {e:?}"
+                        ))
+                    })
                 })
-                .map_err(|e| {
-                    Status::internal(format!(
-                        "Error serializing job metrics for job {job_id} stage {stage_id}: {e:?}"
-                    ))
-                });
-
-                Some(operators.map(|operators| {
-                    ballista_core::serde::protobuf::JobStageMetrics {
-                        stage_id: *stage_id as u32,
-                        partitions: successful.partitions as u32,
-                        operators,
-                    }
-                }))
             })
             .collect::<Result<Vec<_>, Status>>()?;
 
@@ -1033,6 +951,108 @@ fn split_tasks_to_fit(
         }
     }
     (kept, returned)
+}
+
+/// The plan and metrics of a stage that ran, in the shape `GetJobMetrics`
+/// returns, or `None` for a stage that has not run. A failed stage carries the
+/// metrics of the tasks that succeeded before it failed, and the job's failure
+/// reason as its error. A stage with no metrics, e.g. one whose tasks all
+/// failed, lists its operators without any.
+pub(crate) fn job_stage_metrics(
+    stage_id: usize,
+    stage: &ExecutionStage,
+) -> Option<BResult<JobStageMetrics>> {
+    let (plan, partitions, raw_metrics, state, error) = match stage {
+        ExecutionStage::Successful(stage) => (
+            &stage.plan,
+            stage.partitions,
+            stage.stage_metrics.as_slice(),
+            JobStageState::Successful,
+            String::new(),
+        ),
+        ExecutionStage::Failed(stage) => (
+            &stage.plan,
+            stage.partitions,
+            stage.stage_metrics.as_deref().unwrap_or_default(),
+            JobStageState::Failed,
+            stage.error_message.clone(),
+        ),
+        _ => return None,
+    };
+
+    let operators = match stage {
+        // A failed stage whose metrics don't line up with its plan is listed
+        // without them, rather than failing the request for the whole job
+        ExecutionStage::Failed(_) => stage_operators(plan.as_ref(), raw_metrics)
+            .or_else(|_| stage_operators(plan.as_ref(), &[])),
+        _ => stage_operators(plan.as_ref(), raw_metrics),
+    };
+    Some(operators.map(|operators| JobStageMetrics {
+        stage_id: stage_id as u32,
+        partitions: partitions as u32,
+        operators,
+        state: state as i32,
+        error,
+    }))
+}
+
+/// The operators of `root` in depth-first order, each with its metrics from
+/// `raw_metrics`, which holds one set per operator that has metrics.
+fn stage_operators(
+    root: &dyn ExecutionPlan,
+    raw_metrics: &[MetricsSet],
+) -> BResult<Vec<OperatorWithMetrics>> {
+    struct DisplayableOperator<'a> {
+        plan: &'a dyn ExecutionPlan,
+    }
+
+    impl std::fmt::Display for DisplayableOperator<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.plan.fmt_as(DisplayFormatType::Default, f)
+        }
+    }
+
+    let mut operators = vec![];
+    let mut metric_index = 0;
+    let mut stack = vec![(root, 0_u32)];
+    while let Some((plan, depth)) = stack.pop() {
+        let metrics = if plan.metrics().is_some() && !raw_metrics.is_empty() {
+            let metrics: OperatorMetricsSet = raw_metrics
+                .get(metric_index)
+                .ok_or_else(|| {
+                    BallistaError::Internal(format!(
+                        "Missing metrics for operator {} at depth {depth}",
+                        plan.name()
+                    ))
+                })?
+                .clone()
+                .try_into()?;
+            metric_index += 1;
+            metrics.metrics
+        } else {
+            vec![]
+        };
+
+        operators.push(OperatorWithMetrics {
+            depth,
+            operator_type: plan.name().to_string(),
+            operator_desc: DisplayableOperator { plan }.to_string(),
+            metrics,
+        });
+
+        for child in plan.children().into_iter().rev() {
+            stack.push((child.as_ref(), depth + 1));
+        }
+    }
+
+    if !raw_metrics.is_empty() && metric_index != raw_metrics.len() {
+        return Err(BallistaError::Internal(format!(
+            "Stage metrics size mismatch: operators {metric_index} != stage metrics {}",
+            raw_metrics.len()
+        )));
+    }
+
+    Ok(operators)
 }
 
 #[cfg(test)]
@@ -1776,5 +1796,142 @@ mod test {
             .expect("Received error response");
 
         Ok(())
+    }
+
+    /// A running stage whose plan is a shuffle writer over an `EmptyExec`: one
+    /// operator with metrics and one without.
+    fn running_stage(stage_id: usize) -> crate::state::execution_stage::RunningStage {
+        use ballista_core::JobId;
+        use ballista_core::execution_plans::ShuffleWriterExec;
+        use datafusion::physical_plan::ExecutionPlan;
+        use datafusion::physical_plan::empty::EmptyExec;
+        use datafusion::prelude::SessionConfig;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::empty());
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            ShuffleWriterExec::try_new(
+                JobId::new("test-job"),
+                stage_id,
+                Arc::new(EmptyExec::new(schema)),
+                String::new(),
+            )
+            .unwrap(),
+        );
+        crate::state::execution_stage::RunningStage::new(
+            stage_id,
+            0,
+            plan,
+            2,
+            vec![],
+            HashMap::new(),
+            Arc::new(SessionConfig::default()),
+        )
+    }
+
+    /// The metrics of the shuffle writer: `output_rows` rows from partition 0.
+    fn writer_metrics(
+        output_rows: usize,
+    ) -> Vec<datafusion::physical_plan::metrics::MetricsSet> {
+        use datafusion::physical_plan::metrics::{
+            Count, Metric, MetricValue, MetricsSet,
+        };
+        use std::sync::Arc;
+
+        let count = Count::new();
+        count.add(output_rows);
+        let mut set = MetricsSet::new();
+        set.push(Arc::new(Metric::new(
+            MetricValue::OutputRows(count),
+            Some(0),
+        )));
+        vec![set]
+    }
+
+    /// Each operator's type and number of metrics.
+    fn operator_metric_counts(
+        metrics: &ballista_core::serde::protobuf::JobStageMetrics,
+    ) -> Vec<(String, usize)> {
+        metrics
+            .operators
+            .iter()
+            .map(|operator| (operator.operator_type.clone(), operator.metrics.len()))
+            .collect()
+    }
+
+    #[test]
+    fn test_job_stage_metrics_include_failed_stages() {
+        use crate::state::execution_graph::ExecutionStage;
+        use ballista_core::serde::protobuf::JobStageState;
+
+        let shape = |writer, empty| {
+            vec![
+                ("ShuffleWriterExec".to_string(), writer),
+                ("EmptyExec".to_string(), empty),
+            ]
+        };
+
+        let mut stage = running_stage(1);
+        stage.stage_metrics = Some(writer_metrics(10));
+        let metrics = super::job_stage_metrics(
+            1,
+            &ExecutionStage::Successful(stage.to_successful()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(metrics.state(), JobStageState::Successful);
+        assert_eq!(metrics.error, "");
+        assert_eq!(operator_metric_counts(&metrics), shape(1, 0));
+
+        // a failed stage keeps the metrics of the tasks that succeeded first
+        let mut stage = running_stage(2);
+        stage.stage_metrics = Some(writer_metrics(5));
+        let metrics = super::job_stage_metrics(
+            2,
+            &ExecutionStage::Failed(stage.to_failed("boom".to_string())),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(metrics.state(), JobStageState::Failed);
+        assert_eq!(metrics.error, "boom");
+        assert_eq!(operator_metric_counts(&metrics), shape(1, 0));
+
+        // a failed stage whose metrics don't match its plan lists its operators
+        let mut stage = running_stage(6);
+        stage.stage_metrics = Some(vec![writer_metrics(5)[0].clone(); 2]);
+        let metrics = super::job_stage_metrics(
+            6,
+            &ExecutionStage::Failed(stage.to_failed("boom".to_string())),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(operator_metric_counts(&metrics), shape(0, 0));
+
+        // a failed stage none of whose tasks succeeded lists its operators
+        let stage = running_stage(3);
+        let metrics = super::job_stage_metrics(
+            3,
+            &ExecutionStage::Failed(stage.to_failed("boom".to_string())),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(operator_metric_counts(&metrics), shape(0, 0));
+
+        // so does a successful stage whose tasks' metrics were all skipped,
+        // instead of failing the whole request
+        let stage = running_stage(4);
+        let metrics = super::job_stage_metrics(
+            4,
+            &ExecutionStage::Successful(stage.to_successful()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(operator_metric_counts(&metrics), shape(0, 0));
+
+        assert!(
+            super::job_stage_metrics(5, &ExecutionStage::Running(running_stage(5)))
+                .is_none()
+        );
     }
 }

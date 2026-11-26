@@ -179,8 +179,9 @@ impl<T: 'static + AsLogicalPlan> DistributedQueryExec<T> {
     /// scheduler-assigned job id and the plan is only available once the stages
     /// have completed. Returns an error if the query has not been executed yet.
     ///
-    /// Only stages that completed successfully are included, inherited from the
-    /// scheduler's `get_job_metrics`.
+    /// Stages that finished or failed are included, as the scheduler's
+    /// `get_job_metrics` returns them. A failed stage shows the metrics of the
+    /// tasks that succeeded before it failed.
     ///
     /// When `with_metrics` is true the output matches `EXPLAIN ANALYZE`; when
     /// false the `metrics=[...]` suffixes are omitted.
