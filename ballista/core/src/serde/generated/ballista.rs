@@ -1773,6 +1773,26 @@ pub struct HeartBeatParams {
     pub status: ::core::option::Option<ExecutorStatus>,
     #[prost(message, optional, tag = "4")]
     pub metadata: ::core::option::Option<ExecutorRegistration>,
+    /// The operator metrics so far of the tasks running on the executor.
+    #[prost(message, repeated, tag = "5")]
+    pub running_task_metrics: ::prost::alloc::vec::Vec<RunningTaskMetrics>,
+}
+/// The operator metrics of a running task so far. A later snapshot, or the
+/// task's final status, replaces them.
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RunningTaskMetrics {
+    #[prost(string, tag = "1")]
+    pub job_id: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "2")]
+    pub stage_id: u32,
+    #[prost(uint32, tag = "3")]
+    pub task_id: u32,
+    #[prost(message, repeated, tag = "4")]
+    pub metrics: ::prost::alloc::vec::Vec<OperatorMetricsSet>,
+    /// Task ids start again at 0 in each stage attempt.
+    #[prost(uint32, tag = "5")]
+    pub stage_attempt_num: u32,
 }
 #[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]

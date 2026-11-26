@@ -1213,6 +1213,19 @@ message HeartBeatParams {
   repeated ExecutorMetric metrics = 2;
   ExecutorStatus status = 3;
   ExecutorRegistration metadata = 4;
+  // The operator metrics so far of the tasks running on the executor.
+  repeated RunningTaskMetrics running_task_metrics = 5;
+}
+
+// The operator metrics of a running task so far. A later snapshot, or the
+// task's final status, replaces them.
+message RunningTaskMetrics {
+  string job_id = 1;
+  uint32 stage_id = 2;
+  uint32 task_id = 3;
+  repeated OperatorMetricsSet metrics = 4;
+  // Task ids start again at 0 in each stage attempt.
+  uint32 stage_attempt_num = 5;
 }
 
 message HeartBeatResult {

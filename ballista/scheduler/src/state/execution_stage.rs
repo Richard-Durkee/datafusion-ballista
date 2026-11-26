@@ -237,7 +237,9 @@ pub struct RunningStage {
     /// task_id. When any partition exceeds `stage_max_failures`, the
     /// stage is failed.
     pub task_failure_numbers: Vec<usize>,
-    /// Combined metrics of the already finished tasks in the stage, If it is None, no task is finished yet.
+    /// Combined metrics of the stage's tasks: the final metrics of finished
+    /// tasks and the latest snapshots of running ones. None until a task
+    /// reports.
     pub stage_metrics: Option<Vec<MetricsSet>>,
     /// How many operator metrics sets `plan` has, which is how many a task
     /// of this stage reports. A task that reports a different number ran a
@@ -1112,6 +1114,32 @@ impl RunningStage {
                 Self::upsert_metrics_set_for_task(metrics, MetricsSet::new(), partitions);
             *metrics = cleared;
         }
+    }
+
+    /// Merges a snapshot of the metrics of task `task_id` of stage attempt
+    /// `stage_attempt_num`, which an executor sent while the task ran. The
+    /// snapshot is ignored unless the task is still running on `executor_id`
+    /// in this attempt, so a snapshot that arrives after the task's final
+    /// status never replaces its final metrics, and one of an earlier attempt
+    /// never lands on the task that took its id. Returns whether the snapshot
+    /// was merged.
+    pub fn update_running_task_metrics(
+        &mut self,
+        executor_id: &str,
+        stage_attempt_num: usize,
+        task_id: usize,
+        metrics: Vec<OperatorMetricsSet>,
+    ) -> Result<bool> {
+        if stage_attempt_num != self.stage_attempt_num {
+            return Ok(false);
+        }
+        match self.task_infos.get(task_id).map(|info| &info.task_status) {
+            Some(task_status::Status::Running(running))
+                if running.executor_id == executor_id => {}
+            _ => return Ok(false),
+        }
+        self.update_task_metrics(task_id, metrics)?;
+        Ok(true)
     }
 
     /// Logs that `error` made `update_task_metrics` skip the metrics of
@@ -2216,6 +2244,97 @@ mod tests {
             .update_task_metrics(2, vec![make_operator_metrics_set(30, 1)])
             .unwrap();
         assert_eq!(output_rows(&stage), Some(30));
+    }
+
+    /// Snapshots of a running task replace each other, and stop once the task
+    /// has finished, so a late snapshot never replaces the final metrics.
+    #[test]
+    fn test_update_running_task_metrics_only_while_the_task_runs() {
+        let mut stage = make_running_stage(2);
+        append_running_task(&mut stage, 0, "executor-1", vec![0]);
+        let output_rows = |stage: &RunningStage| {
+            stage.stage_metrics.as_ref().unwrap()[0]
+                .aggregate_by_name()
+                .output_rows()
+        };
+
+        assert!(
+            stage
+                .update_running_task_metrics(
+                    "executor-1",
+                    0,
+                    0,
+                    vec![make_operator_metrics_set(5, 1)]
+                )
+                .unwrap()
+        );
+        assert_eq!(output_rows(&stage), Some(5));
+
+        // the task runs on executor-1, not executor-2
+        assert!(
+            !stage
+                .update_running_task_metrics(
+                    "executor-2",
+                    0,
+                    0,
+                    vec![make_operator_metrics_set(100, 1)]
+                )
+                .unwrap()
+        );
+        // an unknown task
+        assert!(
+            !stage
+                .update_running_task_metrics(
+                    "executor-1",
+                    0,
+                    7,
+                    vec![make_operator_metrics_set(100, 1)]
+                )
+                .unwrap()
+        );
+
+        stage
+            .update_running_task_metrics(
+                "executor-1",
+                0,
+                0,
+                vec![make_operator_metrics_set(8, 2)],
+            )
+            .unwrap();
+        assert_eq!(output_rows(&stage), Some(8));
+
+        // a task of an earlier stage attempt that had the same id
+        let mut next_attempt = make_running_stage(2);
+        next_attempt.stage_attempt_num = 1;
+        append_running_task(&mut next_attempt, 0, "executor-1", vec![0]);
+        assert!(
+            !next_attempt
+                .update_running_task_metrics(
+                    "executor-1",
+                    0,
+                    0,
+                    vec![make_operator_metrics_set(100, 1)]
+                )
+                .unwrap()
+        );
+        assert!(next_attempt.stage_metrics.is_none());
+
+        // the final status replaces the last snapshot
+        assert!(stage.update_task_info(0, make_task_status(0)));
+        stage
+            .update_task_metrics(0, vec![make_operator_metrics_set(10, 3)])
+            .unwrap();
+        assert!(
+            !stage
+                .update_running_task_metrics(
+                    "executor-1",
+                    0,
+                    0,
+                    vec![make_operator_metrics_set(9, 3)]
+                )
+                .unwrap()
+        );
+        assert_eq!(output_rows(&stage), Some(10));
     }
 
     #[test]

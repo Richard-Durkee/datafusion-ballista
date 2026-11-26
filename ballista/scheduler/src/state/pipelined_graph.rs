@@ -661,6 +661,20 @@ fn resolve_pipelined_readers(
 }
 
 impl ExecutionGraph for PipelinedExecutionGraph {
+    fn update_running_task_metrics(
+        &mut self,
+        executor_id: &str,
+        snapshots: Vec<ballista_core::serde::protobuf::RunningTaskMetrics>,
+    ) {
+        let job_id = self.job_id().to_string();
+        crate::state::execution_graph::apply_running_task_metrics(
+            &mut self.stages,
+            &job_id,
+            executor_id,
+            snapshots,
+        );
+    }
+
     fn job_id(&self) -> &JobId {
         &self.job_id
     }

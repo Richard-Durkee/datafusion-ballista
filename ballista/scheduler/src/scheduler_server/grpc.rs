@@ -275,6 +275,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
             metrics,
             status,
             metadata,
+            running_task_metrics,
         } = request.into_inner();
         trace!("Received heart beat request for {:?}", executor_id);
 
@@ -361,6 +362,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
             })
             .unwrap_or((current_proc_physical, current_proc_virtual));
 
+        let snapshot_executor_id = executor_id.clone();
         let executor_heartbeat = ExecutorHeartbeat {
             executor_id,
             timestamp: SystemTime::now()
@@ -382,6 +384,26 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 error!("{msg}");
                 Status::internal(msg)
             })?;
+
+        // Merging takes the jobs' graph locks, so it runs off the heartbeat's
+        // path: a busy job must not delay the executor's heartbeat
+        if !running_task_metrics.is_empty()
+            && self
+                .state
+                .task_manager
+                .begin_running_task_metrics(&snapshot_executor_id)
+        {
+            let state = self.state.clone();
+            tokio::spawn(async move {
+                state
+                    .task_manager
+                    .update_running_task_metrics(
+                        &snapshot_executor_id,
+                        running_task_metrics,
+                    )
+                    .await;
+            });
+        }
         Ok(Response::new(HeartBeatResult { reregister: false }))
     }
 
@@ -1282,6 +1304,7 @@ mod test {
         let exec_meta = executor_registration("abc", BALLISTA_PROTOCOL_VERSION);
 
         let request: Request<HeartBeatParams> = Request::new(HeartBeatParams {
+            running_task_metrics: vec![],
             executor_id: exec_meta.id.clone(),
             metrics: vec![],
             status: Some(ExecutorStatus {
@@ -1321,6 +1344,7 @@ mod test {
         for (bytes, status) in [(3000, active), (1000, terminating.clone())] {
             scheduler
                 .heart_beat_from_executor(Request::new(HeartBeatParams {
+                    running_task_metrics: vec![],
                     executor_id: exec_meta.id.clone(),
                     metrics: vec![memory(bytes)],
                     status: Some(ExecutorStatus {
@@ -1399,6 +1423,7 @@ mod test {
         let scheduler = test_scheduler().await?;
         let meta = executor_registration("abc", BALLISTA_PROTOCOL_VERSION + 1);
         let request = Request::new(HeartBeatParams {
+            running_task_metrics: vec![],
             executor_id: meta.id.clone(),
             metrics: vec![],
             status: Some(ExecutorStatus {
@@ -1419,6 +1444,7 @@ mod test {
     async fn heartbeat_rejects_missing_metadata() -> Result<(), BallistaError> {
         let scheduler = test_scheduler().await?;
         let request = Request::new(HeartBeatParams {
+            running_task_metrics: vec![],
             executor_id: "abc".to_owned(),
             metrics: vec![],
             status: Some(ExecutorStatus {
@@ -1485,6 +1511,7 @@ mod test {
 
         // heartbeat from the executor
         let request: Request<HeartBeatParams> = Request::new(HeartBeatParams {
+            running_task_metrics: vec![],
             executor_id: "abc".to_owned(),
             metrics: vec![],
             status: Some(ExecutorStatus {

@@ -890,6 +890,20 @@ fn cannot_rerun_finished_stage(stage_id: usize) -> String {
 }
 
 impl ExecutionGraph for AdaptiveExecutionGraph {
+    fn update_running_task_metrics(
+        &mut self,
+        executor_id: &str,
+        snapshots: Vec<ballista_core::serde::protobuf::RunningTaskMetrics>,
+    ) {
+        let job_id = self.job_id().to_string();
+        crate::state::execution_graph::apply_running_task_metrics(
+            &mut self.stages,
+            &job_id,
+            executor_id,
+            snapshots,
+        );
+    }
+
     fn cloned(&self) -> ExecutionGraphBox {
         Box::new(self.clone())
     }

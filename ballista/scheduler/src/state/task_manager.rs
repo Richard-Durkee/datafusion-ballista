@@ -43,8 +43,8 @@ use ballista_core::execution_plans::plan_algebra::PartitionSliceableResolver;
 use ballista_core::extension::{SessionConfigExt, SessionConfigHelperExt};
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::{
-    JobStatus, MultiTaskDefinition, TaskDefinition, TaskId, TaskStatus, job_status,
-    task_status,
+    JobStatus, MultiTaskDefinition, RunningTaskMetrics, TaskDefinition, TaskId,
+    TaskStatus, job_status, task_status,
 };
 use ballista_core::serde::scheduler::{ExecutorMetadata, PartitionLocation, TaskKey};
 use ballista_core::{JobId, JobStatusSubscriber};
@@ -162,6 +162,22 @@ pub struct TaskManager<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
     partition_sliceable_resolver: Option<Arc<dyn PartitionSliceableResolver>>,
     /// See [`SchedulerConfig::adaptive_rules`].
     adaptive_rules: Option<Arc<dyn AdaptiveRules>>,
+    /// Executors whose running-task snapshots are being merged. One merge
+    /// runs per executor at a time, so merges neither pile up behind a busy
+    /// job nor apply out of order.
+    running_metrics_merges: Arc<DashMap<String, ()>>,
+}
+
+/// Ends an executor's snapshot merge when dropped, also if the merge panics.
+struct RunningMetricsMerge<'a> {
+    merges: &'a DashMap<String, ()>,
+    executor_id: &'a str,
+}
+
+impl Drop for RunningMetricsMerge<'_> {
+    fn drop(&mut self) {
+        self.merges.remove(self.executor_id);
+    }
 }
 
 /// Contains the execution graph and cached data to improve performance
@@ -248,6 +264,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             scheduler_id,
             active_job_cache: Arc::new(DashMap::new()),
             outstanding_task_reservations: Arc::new(DashMap::new()),
+            running_metrics_merges: Arc::new(DashMap::new()),
             launcher,
             task_max_failures: config.task_max_failures,
             stage_max_failures: config.stage_max_failures,
@@ -733,6 +750,45 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             }
         }
         reset
+    }
+
+    /// Starts merging `executor_id`'s running-task snapshots. Returns false
+    /// when a merge of its snapshots is still running: the new ones are then
+    /// dropped, and the executor's next heartbeat brings fresher ones.
+    pub(crate) fn begin_running_task_metrics(&self, executor_id: &str) -> bool {
+        self.running_metrics_merges
+            .insert(executor_id.to_owned(), ())
+            .is_none()
+    }
+
+    /// Merges the metrics snapshots `executor_id` sent in a heartbeat into the
+    /// graphs of their jobs, and ends the merge that
+    /// [`Self::begin_running_task_metrics`] started. Jobs this scheduler
+    /// doesn't hold are skipped.
+    pub(crate) async fn update_running_task_metrics(
+        &self,
+        executor_id: &str,
+        snapshots: Vec<RunningTaskMetrics>,
+    ) {
+        let _merge = RunningMetricsMerge {
+            merges: &self.running_metrics_merges,
+            executor_id,
+        };
+        let mut by_job: HashMap<String, Vec<RunningTaskMetrics>> = HashMap::new();
+        for snapshot in snapshots {
+            by_job
+                .entry(snapshot.job_id.clone())
+                .or_default()
+                .push(snapshot);
+        }
+        for (job_id, snapshots) in by_job {
+            if let Some(cached) = self.get_active_execution_graph(&job_id.into()) {
+                cached
+                    .write()
+                    .await
+                    .update_running_task_metrics(executor_id, snapshots);
+            }
+        }
     }
 
     /// Update given task statuses in the respective job and return a tuple containing:

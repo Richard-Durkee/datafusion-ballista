@@ -30,7 +30,10 @@ use ballista_core::RuntimeProducer;
 use ballista_core::error::BallistaError;
 use ballista_core::execution_plans::PipelinedRegistry;
 use ballista_core::registry::BallistaFunctionRegistry;
-use ballista_core::serde::protobuf::{ExecutorRegistration, ShuffleWritePartition};
+use ballista_core::serde::protobuf::{
+    ExecutorRegistration, OperatorMetricsSet, RunningTaskMetrics, ShuffleWritePartition,
+    operator_metric,
+};
 use ballista_core::serde::scheduler::TaskKey;
 use dashmap::DashMap;
 use datafusion::execution::context::TaskContext;
@@ -44,6 +47,7 @@ use log::warn;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 
@@ -70,6 +74,27 @@ impl Future for TasksDrainedFuture {
 }
 
 type AbortHandles = Arc<DashMap<TaskKey, AbortHandle>>;
+/// Running tasks by task and stage attempt, as task ids start again at 0 in
+/// each stage attempt.
+type RunningTasks = Arc<DashMap<(TaskKey, usize), Arc<dyn QueryStageExecutor>>>;
+
+/// The most metric values a heartbeat carries for running tasks, so that a
+/// wide plan can't make the heartbeat larger than the scheduler accepts. The
+/// tasks past the limit are left out of that heartbeat.
+const MAX_RUNNING_TASK_METRIC_VALUES: usize = 100_000;
+
+/// Removes a task from the running tasks when dropped, also when the future
+/// running the task is dropped before it finishes.
+struct RunningTaskGuard {
+    tasks: RunningTasks,
+    key: (TaskKey, usize),
+}
+
+impl Drop for RunningTaskGuard {
+    fn drop(&mut self) {
+        self.tasks.remove(&self.key);
+    }
+}
 
 /// Ballista executor
 #[derive(Clone)]
@@ -97,6 +122,13 @@ pub struct Executor {
 
     /// Handles to abort executing tasks
     abort_handles: AbortHandles,
+
+    /// The query stages of executing tasks, whose metrics heartbeats report
+    running_tasks: RunningTasks,
+
+    /// Where the next heartbeat starts in the running tasks, so the tasks
+    /// past [`MAX_RUNNING_TASK_METRIC_VALUES`] take turns
+    running_metrics_offset: Arc<AtomicUsize>,
 
     tasks_drained_waker: Arc<AtomicWaker>,
 
@@ -167,6 +199,8 @@ impl Executor {
             metrics_collector,
             vcores,
             abort_handles: Default::default(),
+            running_tasks: Default::default(),
+            running_metrics_offset: Default::default(),
             tasks_drained_waker: Default::default(),
             execution_engine,
             session_runtime_cache: None,
@@ -289,12 +323,75 @@ impl Executor {
         (self.config_producer)().with_extension(self.pipelined_registry.clone())
     }
 
+    /// The operator metrics so far of the tasks executing now. A task whose
+    /// metrics can't be serialized is left out, and so are the tasks past
+    /// [`MAX_RUNNING_TASK_METRIC_VALUES`], which come first in a later
+    /// heartbeat. Start and end timestamps are left out, as operators that
+    /// haven't started yet have none.
+    pub fn running_task_metrics(&self) -> Vec<RunningTaskMetrics> {
+        // Copied out first, so no map shard stays locked while metrics are
+        // collected and tasks can start and finish meanwhile
+        let tasks: Vec<_> = self
+            .running_tasks
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        if tasks.is_empty() {
+            return vec![];
+        }
+        let start =
+            self.running_metrics_offset.fetch_add(1, Ordering::Relaxed) % tasks.len();
+
+        let mut budget = MAX_RUNNING_TASK_METRIC_VALUES;
+        let mut snapshots = vec![];
+        for ((key, stage_attempt_num), stage_exec) in
+            tasks.iter().cycle().skip(start).take(tasks.len())
+        {
+            let plan_metrics = stage_exec.collect_plan_metrics();
+            let values = plan_metrics
+                .iter()
+                .map(|set| set.iter().count())
+                .sum::<usize>();
+            if values > budget {
+                continue;
+            }
+            let Ok(mut metrics) = plan_metrics
+                .into_iter()
+                .map(|metrics| metrics.try_into())
+                .collect::<Result<Vec<OperatorMetricsSet>, BallistaError>>()
+            else {
+                continue;
+            };
+            budget -= values;
+            for set in &mut metrics {
+                set.metrics.retain(|metric| {
+                    !matches!(
+                        metric.metric,
+                        Some(
+                            operator_metric::Metric::StartTimestamp(_)
+                                | operator_metric::Metric::EndTimestamp(_)
+                        )
+                    )
+                });
+            }
+            snapshots.push(RunningTaskMetrics {
+                job_id: key.job_id.to_string(),
+                stage_id: key.stage_id as u32,
+                task_id: key.task_id as u32,
+                metrics,
+                stage_attempt_num: *stage_attempt_num as u32,
+            });
+        }
+        snapshots
+    }
+
     /// Execute one partition of a query stage and persist the result to disk in IPC format. On
     /// success, return a RecordBatch containing metadata about the results, including path
     /// and statistics.
     pub async fn execute_query_stage(
         &self,
         key: TaskKey,
+        stage_attempt_num: usize,
         query_stage_exec: Arc<dyn QueryStageExecutor>,
         task_ctx: Arc<TaskContext>,
     ) -> Result<Vec<ShuffleWritePartition>, BallistaError> {
@@ -303,6 +400,13 @@ impl Executor {
         );
 
         self.abort_handles.insert(key.clone(), abort_handle);
+        let running_key = (key.clone(), stage_attempt_num);
+        self.running_tasks
+            .insert(running_key.clone(), query_stage_exec.clone());
+        let _running = RunningTaskGuard {
+            tasks: self.running_tasks.clone(),
+            key: running_key,
+        };
 
         let partitions = match std::panic::AssertUnwindSafe(task).catch_unwind().await {
             Ok(Ok(result)) => result.map_err(BallistaError::from),
@@ -582,7 +686,7 @@ mod test {
         let task_ctx = ctx.task_ctx();
         tokio::task::spawn(async move {
             let task_result = executor
-                .execute_query_stage(key, Arc::new(query_stage_exec), task_ctx)
+                .execute_query_stage(key, 0, Arc::new(query_stage_exec), task_ctx)
                 .await;
             sender.send(task_result).expect("sending result");
         });
@@ -668,6 +772,48 @@ mod test {
 
         assert_eq!(wake_counter.0.load(Ordering::SeqCst), 1);
         assert_eq!(tasks_drained.as_mut().poll(&mut context), Poll::Ready(()));
+    }
+
+    #[tokio::test]
+    async fn test_running_task_metrics_cover_running_tasks_only() {
+        let temp_dir = TempDir::new().unwrap();
+        let work_dir = temp_dir.path().to_str().unwrap();
+        let (executor, ctx) = never_ending_executor(work_dir);
+        assert!(executor.running_task_metrics().is_empty());
+
+        let (receiver, _input_refs) = spawn_never_ending_task(
+            &executor,
+            &ctx,
+            work_dir,
+            TaskKey {
+                job_id: "job-id".into(),
+                stage_id: 1,
+                task_id: 3,
+            },
+        );
+        await_active_task_count(&executor, 1).await;
+
+        let snapshots = executor.running_task_metrics();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            (
+                snapshots[0].job_id.as_str(),
+                snapshots[0].stage_id,
+                snapshots[0].task_id
+            ),
+            ("job-id", 1, 3)
+        );
+        // one set per operator with metrics: the shuffle writer
+        assert!(!snapshots[0].metrics.is_empty());
+
+        assert!(
+            executor
+                .cancel_task("job-id".into(), 1, 3)
+                .await
+                .expect("cancelling task")
+        );
+        await_cancelled_task(receiver).await;
+        assert!(executor.running_task_metrics().is_empty());
     }
 
     #[tokio::test]

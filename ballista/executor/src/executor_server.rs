@@ -472,7 +472,12 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
                 let task_start = Instant::now();
                 let execution_result = self
                     .executor
-                    .execute_query_stage(key.clone(), exec.clone(), task_context)
+                    .execute_query_stage(
+                        key.clone(),
+                        stage_attempt_num,
+                        exec.clone(),
+                        task_context,
+                    )
                     .await;
                 info!(
                     "Finished task : [{task_identity}] in {:?}",
@@ -953,6 +958,7 @@ pub(crate) fn heartbeat_params(
             status: Some(status),
         }),
         metadata: Some(executor.metadata.clone()),
+        running_task_metrics: executor.running_task_metrics(),
     }
 }
 

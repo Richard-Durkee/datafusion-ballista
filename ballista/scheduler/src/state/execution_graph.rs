@@ -40,7 +40,7 @@ use ballista_core::serde::protobuf::{
     FailedTask, JobStatus, ResultLost, RunningJob, SuccessfulJob, SuccessfulTask,
     TaskStatus,
 };
-use ballista_core::serde::protobuf::{RunningTask, task_status};
+use ballista_core::serde::protobuf::{RunningTask, RunningTaskMetrics, task_status};
 use ballista_core::serde::scheduler::{
     ExecutorEndpoint, ExecutorMetadata, PartitionId, PartitionLocation, PartitionStats,
     TaskKey,
@@ -161,6 +161,14 @@ pub trait ExecutionGraph: Debug {
         max_task_failures: usize,
         max_stage_failures: usize,
     ) -> Result<Vec<QueryStageSchedulerEvent>>;
+
+    /// Merges the metrics snapshots `executor_id` sent for tasks it is still
+    /// running. Snapshots of tasks that finished, or run elsewhere, are ignored.
+    fn update_running_task_metrics(
+        &mut self,
+        executor_id: &str,
+        snapshots: Vec<RunningTaskMetrics>,
+    );
 
     /// Returns all the currently running stage IDs.
     fn running_stages(&self) -> Vec<usize>;
@@ -815,7 +823,44 @@ impl StaticExecutionGraph {
     }
 }
 
+/// Merges metrics snapshots of running tasks into the running stages of a job.
+pub(crate) fn apply_running_task_metrics(
+    stages: &mut HashMap<usize, ExecutionStage>,
+    job_id: &str,
+    executor_id: &str,
+    snapshots: Vec<RunningTaskMetrics>,
+) {
+    for snapshot in snapshots {
+        let task_id = snapshot.task_id as usize;
+        if let Some(ExecutionStage::Running(stage)) =
+            stages.get_mut(&(snapshot.stage_id as usize))
+            && let Err(e) = stage.update_running_task_metrics(
+                executor_id,
+                snapshot.stage_attempt_num as usize,
+                task_id,
+                snapshot.metrics,
+            )
+        {
+            // Not a warning: a running task reports every heartbeat, and its
+            // final status is what counts
+            debug!(
+                "Ignoring a metrics snapshot of task {task_id} in stage {} of job {job_id}: {e}",
+                snapshot.stage_id
+            );
+        }
+    }
+}
+
 impl ExecutionGraph for StaticExecutionGraph {
+    fn update_running_task_metrics(
+        &mut self,
+        executor_id: &str,
+        snapshots: Vec<RunningTaskMetrics>,
+    ) {
+        let job_id = self.job_id().to_string();
+        apply_running_task_metrics(&mut self.stages, &job_id, executor_id, snapshots);
+    }
+
     fn cloned(&self) -> ExecutionGraphBox {
         Box::new(self.clone())
     }

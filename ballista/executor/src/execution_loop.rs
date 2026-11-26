@@ -434,6 +434,7 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
         let task_start = Instant::now();
         let execution_result = match AssertUnwindSafe(executor.execute_query_stage(
             key.clone(),
+            stage_attempt_num as usize,
             query_stage_exec.clone(),
             task_context,
         ))
